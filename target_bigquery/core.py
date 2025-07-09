@@ -17,6 +17,7 @@ import shutil
 import sys
 import time
 import traceback
+import unicodedata
 from abc import ABC, abstractmethod
 
 try:
@@ -721,6 +722,7 @@ class SchemaTranslator:
         more flexible though the denormalization can only be said to be partial if a type is not
         resolved. Most of the time this is fine but for the sake of consistency, we default to v1.
         """
+        name = sanitize_bigquery_name(name)
         if self.resolver_version == SchemaResolverVersion.V1:
             # This is the original resolver, which is used by the denormalized strategy
             if "anyOf" in schema_property and len(schema_property["anyOf"]) > 0:
@@ -996,7 +998,17 @@ def bigquery_type(property_type: List[str], property_format: Optional[str] = Non
         return "record"
     else:
         return "string"
-
+    
+def sanitize_bigquery_name(name: str) -> str:
+        """Sanitize a BigQuery name to ensure it is valid."""
+        # Remove invalid characters and replace spaces with underscores
+        name = unicodedata.normalize('NFKD', name)
+        name = name.encode('ascii', 'ignore').decode('ascii')
+        name = re.sub(r"[^a-zA-Z0-9_]+", "_", name)
+        # Ensure the name does not start with a digit
+        if name and name[0].isdigit():
+            name = "_" + name
+        return name
 
 # Column name transforms are configurable and entirely opt-in.
 # This allows users to only use the transforms they need and not
@@ -1024,4 +1036,4 @@ def transform_column_name(
             name = "_{}".format(name)
     if quote or was_quoted:
         name = "`{}`".format(name)
-    return name
+    return sanitize_bigquery_name(name)
