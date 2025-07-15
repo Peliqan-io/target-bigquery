@@ -94,7 +94,7 @@ class BigQueryTable:
     """The ingestion strategy for this table."""
     transforms: Dict[str, bool] = field(default_factory=dict)
     """A dict of transformation rules to apply to the table schema."""
-    schema_resolver_version: SchemaResolverVersion = SchemaResolverVersion.V1
+    schema_resolver_version: SchemaResolverVersion = SchemaResolverVersion.V2
 
     @property
     def schema_translator(self) -> "SchemaTranslator":
@@ -298,7 +298,7 @@ class BaseBigQuerySink(BatchSink):
             "jsonschema": self.schema,
             "transforms": self.config.get("column_name_transforms", {}),
             "ingestion_strategy": self.ingestion_strategy,
-            "schema_resolver_version": SchemaResolverVersion(self.config.get("schema_resolver_version", 1)),
+            "schema_resolver_version": SchemaResolverVersion(self.config.get("schema_resolver_version", 2)),
         }
         self.table = BigQueryTable(name=self.table_name, **opts)
         self.create_target(key_properties=key_properties)
@@ -646,7 +646,7 @@ class SchemaTranslator:
         self,
         schema: Dict[str, Any],
         transforms: Dict[str, bool],
-        resolver_version: SchemaResolverVersion = SchemaResolverVersion.V1,
+        resolver_version: SchemaResolverVersion = SchemaResolverVersion.V2,
     ) -> None:
         self.schema = schema
         self.transforms = transforms
@@ -766,6 +766,8 @@ class SchemaTranslator:
                     if "items" not in schema_property or "type" not in schema_property["items"]:
                         return SchemaField(name, "JSON", "REPEATED")
                     items_schema: dict = schema_property["items"]
+                    if (items_schema.get("type") == "object" or "object" in items_schema.get("type")) and not items_schema.get("properties"):
+                        return SchemaField(name, "JSON", "REPEATED")
                     if "patternProperties" in items_schema:
                         return SchemaField(name, "JSON", "REPEATED")
                     items_type = bigquery_type(items_schema["type"], items_schema.get("format", None))
