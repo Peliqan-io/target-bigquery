@@ -17,6 +17,7 @@ import shutil
 import sys
 import time
 import traceback
+import unicodedata
 from abc import ABC, abstractmethod
 
 try:
@@ -93,7 +94,7 @@ class BigQueryTable:
     """The ingestion strategy for this table."""
     transforms: Dict[str, bool] = field(default_factory=dict)
     """A dict of transformation rules to apply to the table schema."""
-    schema_resolver_version: SchemaResolverVersion = SchemaResolverVersion.V1
+    schema_resolver_version: SchemaResolverVersion = SchemaResolverVersion.V2
 
     @property
     def schema_translator(self) -> "SchemaTranslator":
@@ -297,7 +298,7 @@ class BaseBigQuerySink(BatchSink):
             "jsonschema": self.schema,
             "transforms": self.config.get("column_name_transforms", {}),
             "ingestion_strategy": self.ingestion_strategy,
-            "schema_resolver_version": SchemaResolverVersion(self.config.get("schema_resolver_version", 1)),
+            "schema_resolver_version": SchemaResolverVersion(self.config.get("schema_resolver_version", 2)),
         }
         self.table = BigQueryTable(name=self.table_name, **opts)
         self.create_target(key_properties=key_properties)
@@ -645,7 +646,7 @@ class SchemaTranslator:
         self,
         schema: Dict[str, Any],
         transforms: Dict[str, bool],
-        resolver_version: SchemaResolverVersion = SchemaResolverVersion.V1,
+        resolver_version: SchemaResolverVersion = SchemaResolverVersion.V2,
     ) -> None:
         self.schema = schema
         self.transforms = transforms
@@ -721,6 +722,7 @@ class SchemaTranslator:
         more flexible though the denormalization can only be said to be partial if a type is not
         resolved. Most of the time this is fine but for the sake of consistency, we default to v1.
         """
+        name = sanitize_bigquery_name(name)
         if self.resolver_version == SchemaResolverVersion.V1:
             # This is the original resolver, which is used by the denormalized strategy
             if "anyOf" in schema_property and len(schema_property["anyOf"]) > 0:
@@ -764,6 +766,8 @@ class SchemaTranslator:
                     if "items" not in schema_property or "type" not in schema_property["items"]:
                         return SchemaField(name, "JSON", "REPEATED")
                     items_schema: dict = schema_property["items"]
+                    if (items_schema.get("type") == "object" or "object" in items_schema.get("type")) and not items_schema.get("properties"):
+                        return SchemaField(name, "JSON", "REPEATED")
                     if "patternProperties" in items_schema:
                         return SchemaField(name, "JSON", "REPEATED")
                     items_type = bigquery_type(items_schema["type"], items_schema.get("format", None))
@@ -996,7 +1000,17 @@ def bigquery_type(property_type: List[str], property_format: Optional[str] = Non
         return "record"
     else:
         return "string"
-
+    
+def sanitize_bigquery_name(name: str) -> str:
+        """Sanitize a BigQuery name to ensure it is valid."""
+        # Remove invalid characters and replace spaces with underscores
+        name = unicodedata.normalize('NFKD', name)
+        name = name.encode('ascii', 'ignore').decode('ascii')
+        name = re.sub(r"[^a-zA-Z0-9_]+", "_", name)
+        # Ensure the name does not start with a digit
+        if name and name[0].isdigit():
+            name = "_" + name
+        return name
 
 # Column name transforms are configurable and entirely opt-in.
 # This allows users to only use the transforms they need and not
@@ -1024,4 +1038,4 @@ def transform_column_name(
             name = "_{}".format(name)
     if quote or was_quoted:
         name = "`{}`".format(name)
-    return name
+    return sanitize_bigquery_name(name)

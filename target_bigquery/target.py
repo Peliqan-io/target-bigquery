@@ -307,9 +307,9 @@ class TargetBigQuery(Target):
         th.Property(
             "schema_resolver_version",
             th.IntegerType,
-            default=1,
+            default=2,
             description=(
-                "The version of the schema resolver to use. Defaults to 1. Version 2 uses JSON as a"
+                "The version of the schema resolver to use. Defaults to 2. Version 2 uses JSON as a"
                 " fallback during denormalization. This only has an effect if denormalized=true"
             ),
             allowed_values=[1, 2],
