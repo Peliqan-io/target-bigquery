@@ -32,7 +32,7 @@ python = "<3.12,>=3.8"
 requests = ">=2.25.1"
 singer-sdk = {git = "https://github.com/peliqan-io/meltano-sdk", branch = "main"}
 google-cloud-bigquery = { version = ">=3.4.1,<4", extras = ["bqstorage"] }
-google-api-core = "2.27.0"
+google-api-core = "<=2.27.0"
 orjson = ">=3.7.2,<4"
 tenacity = ">=8.0.1,<9"
 grpcio-tools = ">=1.51.1,<2"
