@@ -519,12 +519,27 @@ class BaseBigQuerySink(BatchSink):
                 f"INSERT ({', '.join(f'`{f.name}`' for f in target.schema)}) "
                 f"VALUES ({', '.join(f'source.`{f.name}`' for f in target.schema)})"
             )
-            self.client.query(
+            merge_sql = (
                 f"{ctas_tmp}; {merge_clause} "
                 f"WHEN MATCHED THEN {update_clause} "
                 f"WHEN NOT MATCHED THEN {insert_clause}; "
                 f"DROP TABLE IF EXISTS {self.table.get_escaped_name()};"
-            ).result()
+            )
+            try:
+                self.client.query(merge_sql).result()
+            except Exception as exc:
+                self.logger.warning(
+                    "Merge failed for stream '%s', falling back to DROP of temp table '%s'. Error: %s",
+                    self.stream_name,
+                    self.table,
+                    exc,
+                )
+                try:
+                    self.client.query(
+                        f"DROP TABLE IF EXISTS {self.table.get_escaped_name()};"
+                    ).result()
+                except Exception:
+                    pass
             self.table = self.merge_target
             self.merge_target = None
         elif self.overwrite_target is not None:
