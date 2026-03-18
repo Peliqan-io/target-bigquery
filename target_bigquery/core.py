@@ -405,8 +405,15 @@ class BaseBigQuerySink(BatchSink):
 
     @property
     def table_name(self) -> str:
-        """Returns the table name."""
-        return self.stream_name.lower().replace("-", "_").replace(".", "_")
+        """Returns the table name, optionally prefixed with table_name_prefix and connector_name_prefix."""
+        base = self.stream_name.lower().replace("-", "_").replace(".", "_")
+        prefix = self.config.get("table_name_prefix", "")
+        connector = self.config.get("connector_name_prefix", "")
+        if connector:
+            return f"{prefix}{connector}_{base}"
+        if prefix:
+            return f"{prefix}{base}"
+        return base
 
     @property
     def max_size(self) -> int:

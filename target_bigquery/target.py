@@ -203,6 +203,18 @@ class TargetBigQuery(Target):
             required=False,
         ),
         th.Property(
+            "table_name_prefix",
+            th.StringType,
+            description="A fixed prefix prepended to all table names (e.g. 'bronze_').",
+            required=False,
+        ),
+        th.Property(
+            "connector_name_prefix",
+            th.StringType,
+            description="A connector/source name prepended after table_name_prefix (e.g. 'exactonline').",
+            required=False,
+        ),
+        th.Property(
             "options",
             th.ObjectType(
                 th.Property(
