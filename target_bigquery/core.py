@@ -39,7 +39,7 @@ from tempfile import TemporaryFile
 from textwrap import dedent, indent
 from typing import IO, TYPE_CHECKING, Any, Dict, Iterable, List, Optional, Tuple, Type, Union
 
-from google.api_core.exceptions import Conflict
+from google.api_core.exceptions import NotFound
 from google.cloud import bigquery, bigquery_storage_v1, storage
 from google.cloud.bigquery import SchemaField
 from google.cloud.bigquery.table import TimePartitioning, TimePartitioningType
@@ -165,32 +165,35 @@ class BigQueryTable:
 
         This is a convenience method that wraps the creation of a dataset and
         table in a single method call. It is idempotent and will not create
-        a new table if one already exists."""
+        a new table if one already exists.
+
+        Uses a get-then-create pattern (mirroring `create_bucket_if_not_exists`
+        in gcs_stage.py) to avoid emitting spurious 409 Conflict entries into
+        BigQuery's Admin Activity audit logs on every sync run."""
         if not hasattr(self, "_dataset"):
             try:
-                self._dataset = client.create_dataset(
-                    self.as_dataset(**kwargs["dataset"]), exists_ok=False
-                )
-            except Conflict:
-                dataset = client.get_dataset(self.as_dataset(**kwargs["dataset"]))
-                if dataset.location != kwargs["dataset"]["location"]:
+                self._dataset = client.get_dataset(self.as_dataset_ref())
+                if self._dataset.location != kwargs["dataset"]["location"]:
                     raise Exception(
-                        f"Location of existing dataset {dataset.dataset_id} ({dataset.location}) "
+                        f"Location of existing dataset {self._dataset.dataset_id} ({self._dataset.location}) "
                         f"does not match specified location: {kwargs['dataset']['location']}"
                     )
-                else:
-                    self._dataset = dataset
+            except NotFound:
+                self._dataset = client.create_dataset(
+                    self.as_dataset(**kwargs["dataset"])
+                )
+                # Wait for eventual consistency
+                time.sleep(5)
         if not hasattr(self, "_table"):
             try:
+                self._table = client.get_table(self.as_ref())
+            except NotFound:
                 self._table = client.create_table(
                     self.as_table(
                         apply_transforms and self.ingestion_strategy != IngestionStrategy.FIXED,
                         **kwargs["table"],
                     )
                 )
-            except Conflict:
-                self._table = client.get_table(self.as_ref())
-            else:
                 # Wait for eventual consistency
                 time.sleep(5)
         return self._dataset, self._table
