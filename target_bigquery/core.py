@@ -172,7 +172,7 @@ class BigQueryTable:
         BigQuery's Admin Activity audit logs on every sync run."""
         if not hasattr(self, "_dataset"):
             try:
-                dataset = client.get_dataset(self.as_dataset_ref())
+                dataset = client.get_dataset(self.as_dataset(**kwargs["dataset"]))
                 if dataset.location != kwargs["dataset"]["location"]:
                     raise Exception(
                         f"Location of existing dataset {dataset.dataset_id} ({dataset.location}) "
