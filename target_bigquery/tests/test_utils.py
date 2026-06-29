@@ -4,6 +4,8 @@ import pytest
 import singer_sdk.typing as th
 from google.cloud.bigquery import SchemaField
 
+from unittest.mock import MagicMock, patch, call
+
 from target_bigquery.core import SchemaTranslator, bigquery_type, transform_column_name, BigQueryTable, IngestionStrategy
 from target_bigquery.proto_gen import proto_schema_factory_v2
 
@@ -701,3 +703,43 @@ def test_jit_compile_proto():
         == b"\x08\x01\x12\x04test\x19\x00\x00\x00\x00\x00\x00\xf0?"
         b" \x01*\n2020-01-012\n2020-01-01:\x0800:00:00"
     )
+
+
+# --------------------------------------------------------------------------- #
+# delete-sync (DELETERECORD)                                                    #
+# --------------------------------------------------------------------------- #
+
+
+def _bare_target(config=None, buffer=None):
+    """A TargetBigQuery without __init__ (no worker pool / no BQ client)."""
+    from target_bigquery.target import TargetBigQuery
+
+    t = TargetBigQuery.__new__(TargetBigQuery)
+    t._delete_buffer = {} if buffer is None else buffer
+    t._config = config or {"project": "p", "dataset": "d"}
+    t._credentials = MagicMock()
+    return t
+
+
+def test_process_unknown_message_buffers_deleterecord():
+    t = _bare_target()
+    t._process_unknown_message(
+        {"type": "DELETERECORD", "stream": "Accounts", "record": {"id": "a1"}}
+    )
+    t._process_unknown_message(
+        {"type": "DELETERECORD", "stream": "Accounts", "record": {"id": "a2"}}
+    )
+    t._process_unknown_message(
+        {"type": "DELETERECORD", "stream": "Contacts", "record": {"id": "c1"}}
+    )
+    assert t._delete_buffer == {
+        "Accounts": [{"id": "a1"}, {"id": "a2"}],
+        "Contacts": [{"id": "c1"}],
+    }
+
+
+def test_process_unknown_message_raises_for_other_types():
+    t = _bare_target()
+    with pytest.raises(ValueError):
+        t._process_unknown_message({"type": "SOMETHING_ELSE"})
+    assert t._delete_buffer == {}

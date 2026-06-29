@@ -325,6 +325,10 @@ class TargetBigQuery(Target):
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
         self.max_parallelism = 1
+        # Buffer for DELETERECORD Singer messages keyed by stream name.
+        # Populated in _process_unknown_message; flushed once at end-of-pipe
+        # after all sink.clean_up() calls so upserts always land before deletes.
+        self._delete_buffer: dict = {}
         (
             self.proc_cls,
             self.pipe_cls,
@@ -491,6 +495,28 @@ class TargetBigQuery(Target):
         if not existing_sink:
             return self.add_sink(stream_name, schema, key_properties)
         return existing_sink
+
+    # ------------------------------------------------------------------ #
+    # delete-sync support                                                  #
+    # ------------------------------------------------------------------ #
+
+    supports_delete_sync: bool = True
+    """Advertises delete-sync capability to baserow's target-support gate."""
+
+    def _process_unknown_message(self, message_dict: dict) -> None:
+        """Intercept DELETERECORD messages; delegate everything else to the SDK.
+
+        DELETERECORD is a Peliqan Singer extension not in the SDK's
+        SingerMessageType enum, so the SDK routes it here.  We buffer the
+        record keyed by stream; _flush_deletes() drains the buffer at
+        end-of-pipe, after all sink.clean_up() upserts have completed.
+        """
+        if message_dict.get("type") == "DELETERECORD":
+            stream = message_dict.get("stream", "")
+            record = message_dict.get("record", {})
+            self._delete_buffer.setdefault(stream, []).append(record)
+            return
+        super()._process_unknown_message(message_dict)
 
     def drain_one(self, sink: Sink) -> None:  # type: ignore
         """Drain a sink. Includes a hook to manage the worker pool and notifications."""
