@@ -804,6 +804,17 @@ def test_flush_denormalized_composite_pk():
     assert _vals(client) == ["1\u001f2"]
 
 
+def test_flush_chunks_by_batch_size():
+    records = [{"id": f"a{i}"} for i in range(5)]
+    _, client = _run_flush({"Accounts": records}, extra_config={"batch_size": 2})
+    assert client.query.call_count == 3  # 2 + 2 + 1
+    chunks = [
+        c.kwargs["job_config"].query_parameters[0].values
+        for c in client.query.call_args_list
+    ]
+    assert chunks == [["a0", "a1"], ["a2", "a3"], ["a4"]]
+
+
 def test_flush_skips_missing_table_and_continues():
     # NotFound (table/dataset absent) is a best-effort skip; other streams still run.
     from google.api_core.exceptions import NotFound

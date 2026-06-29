@@ -609,6 +609,12 @@ class TargetBigQuery(Target):
                 return f"CAST(`{col}` AS STRING)"
             return f"JSON_VALUE(data, '$.{col}')"
 
+        # Reuse the write-path batch size (baserow -> 5000, default fallback
+        # 10_000). The values ride in a query parameter so query length is not the
+        # limit, but chunking keeps each request well under BigQuery's 10 MB cap
+        # and emits one DELETE per chunk (DML-quota friendly).
+        batch_size = self.config.get("batch_size", 10_000)
+
         for stream, records in self._delete_buffer.items():
             if not records:
                 continue
@@ -626,11 +632,15 @@ class TargetBigQuery(Target):
                 vals = ["\u001f".join(str(r[c]) for c in cols) for r in records]
 
             sql = f"DELETE FROM {escaped} WHERE {key_expr} IN UNNEST(@vals)"
-            job_config = bigquery.QueryJobConfig(
-                query_parameters=[bigquery.ArrayQueryParameter("vals", "STRING", vals)]
-            )
             try:
-                client.query(sql, job_config=job_config).result()
+                for start in range(0, len(vals), batch_size):
+                    chunk = vals[start:start + batch_size]
+                    job_config = bigquery.QueryJobConfig(
+                        query_parameters=[
+                            bigquery.ArrayQueryParameter("vals", "STRING", chunk)
+                        ]
+                    )
+                    client.query(sql, job_config=job_config).result()
                 self.logger.info(
                     "delete-sync: removed up to %d row(s) from %s", len(vals), name
                 )
