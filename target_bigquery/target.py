@@ -20,6 +20,7 @@ from singer_sdk import typing as th
 from singer_sdk.target_base import Target
 
 from target_bigquery.batch_job import BigQueryBatchJobDenormalizedSink, BigQueryBatchJobSink
+from google.api_core.exceptions import NotFound
 from google.cloud import bigquery
 
 from target_bigquery.core import (
@@ -569,16 +570,18 @@ class TargetBigQuery(Target):
                 worker = self.workers.pop()
             for sink in self._sinks_active.values():
                 sink.clean_up()
-            # Apply buffered DELETERECORDs after upserts (clean_up) so an upsert
-            # + delete of the same key in one run ends deleted. Only at
-            # end-of-pipe, so deletes run once with the full buffer.
-            if self._delete_buffer:
-                self._flush_deletes()
         else:
             for worker in self.workers:
                 worker.join()
             for sink in self._sinks_active.values():
                 sink.pre_state_hook()
+        # Apply buffered DELETERECORDs *before* advancing state, so the bookmark
+        # never moves past deletes that were not applied. At end-of-pipe this runs
+        # after the clean_up() upserts above (an upsert + delete of the same key in
+        # one run ends deleted). A real delete failure raises here, so the state
+        # write below is skipped and the tap replays the deletes on the next run.
+        if self._delete_buffer:
+            self._flush_deletes()
         if state:
             self._write_state_message(state)
         self._reset_max_record_age()
@@ -586,7 +589,14 @@ class TargetBigQuery(Target):
     def _flush_deletes(self) -> None:
         """Apply buffered DELETERECORDs as one batched, parameterized DELETE per
         table. Storage-mode-aware (FIXED -> JSON_VALUE(data,...), DENORMALIZED ->
-        real columns) and best-effort: a failed DELETE is logged, never raised."""
+        real columns).
+
+        Error policy mirrors target-postgres: a delete that cannot be *applied* is
+        a best-effort skip -- a key matching no rows is not an error in BigQuery
+        (0 rows affected, no exception), and a missing table/dataset (NotFound,
+        e.g. a stream never synced) is logged and skipped. Any other failure
+        (connection, credentials, permission, quota, bad SQL) is raised so the
+        caller does not advance the bookmark past deletes that never landed."""
         client = bigquery_client_factory(self._credentials)
         denormalized = self.config.get("denormalized", False)
         project, dataset = self.config["project"], self.config["dataset"]
@@ -624,9 +634,15 @@ class TargetBigQuery(Target):
                 self.logger.info(
                     "delete-sync: removed up to %d row(s) from %s", len(vals), name
                 )
-            except Exception as e:  # best-effort: never fail the pipeline on a delete
+            except NotFound:
+                # Table/dataset absent (e.g. a stream that was never synced). The
+                # delete cannot apply; skip best-effort and continue other streams.
                 self.logger.warning(
-                    "delete-sync: DELETE failed for %s: %s", name, e
+                    "delete-sync: table %s not found; skipping its deletes", name
                 )
+                continue
+            # Any other exception (connection, credentials, permission, quota, bad
+            # SQL) propagates: drain_all aborts before writing state, so the
+            # bookmark is not advanced and the tap replays these deletes next run.
 
         self._delete_buffer.clear()

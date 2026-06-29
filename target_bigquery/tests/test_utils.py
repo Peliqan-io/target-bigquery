@@ -804,13 +804,48 @@ def test_flush_denormalized_composite_pk():
     assert _vals(client) == ["1\u001f2"]
 
 
-def test_flush_is_best_effort_and_clears_buffer():
-    t, client = _run_flush(
-        {"Accounts": [{"id": "a1"}]}, query_side_effect=Exception("boom")
-    )
-    # No exception propagated, buffer drained.
-    assert client.query.call_count == 1
-    assert t._delete_buffer == {}
+def test_flush_skips_missing_table_and_continues():
+    # NotFound (table/dataset absent) is a best-effort skip; other streams still run.
+    from google.api_core.exceptions import NotFound
+
+    t = _bare_target(buffer={"Gone": [{"id": "x"}], "Accounts": [{"id": "a1"}]})
+    client = MagicMock()
+    client.query.side_effect = [NotFound("missing"), MagicMock()]
+    with patch("target_bigquery.target.bigquery_client_factory", return_value=client):
+        t._flush_deletes()  # must not raise
+    assert client.query.call_count == 2  # second stream still attempted
+    assert t._delete_buffer == {}  # cleared after a clean pass
+
+
+def test_flush_raises_on_real_error_and_keeps_buffer():
+    # A real failure (connection/credential/etc.) must propagate so state never
+    # advances, and the buffer is NOT cleared.
+    t = _bare_target(buffer={"Accounts": [{"id": "a1"}]})
+    client = MagicMock()
+    client.query.side_effect = Exception("connection reset")
+    with patch("target_bigquery.target.bigquery_client_factory", return_value=client):
+        with pytest.raises(Exception):
+            t._flush_deletes()
+    assert t._delete_buffer == {"Accounts": [{"id": "a1"}]}
+
+
+def test_drain_all_does_not_write_state_when_delete_fails():
+    # The bookmark must not advance past a delete that failed: a raising flush
+    # aborts drain_all before _write_state_message.
+    t = _bare_target(buffer={"Accounts": [{"id": "a1"}]})
+    t._latest_state = {"bookmarks": {"x": 1}}
+    t._sinks_active = {}
+    t.workers = []
+    t.max_parallelism = 1
+    t._drain_all = MagicMock()
+    t._write_state_message = MagicMock()
+    t._reset_max_record_age = MagicMock()
+    client = MagicMock()
+    client.query.side_effect = Exception("creds error")
+    with patch("target_bigquery.target.bigquery_client_factory", return_value=client):
+        with pytest.raises(Exception):
+            t.drain_all(is_endofpipe=True)
+    t._write_state_message.assert_not_called()
 
 
 def test_flush_one_query_per_stream():
