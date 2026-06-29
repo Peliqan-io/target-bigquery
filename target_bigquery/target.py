@@ -29,6 +29,7 @@ from target_bigquery.core import (
     BigQueryCredentials,
     ParType,
     bigquery_client_factory,
+    transform_column_name,
 )
 from target_bigquery.gcs_stage import BigQueryGcsStagingDenormalizedSink, BigQueryGcsStagingSink
 from target_bigquery.storage_write import (
@@ -601,12 +602,17 @@ class TargetBigQuery(Target):
         denormalized = self.config.get("denormalized", False)
         project, dataset = self.config["project"], self.config["dataset"]
         prefix = self.config.get("table_name_prefix", "")
+        transforms = self.config.get("column_name_transforms", {})
 
         def accessor(col: str) -> str:
             # Compare as text: JSON_VALUE returns STRING; CAST aligns typed columns
             # with the str()-rendered parameter values.
             if denormalized:
-                return f"CAST(`{col}` AS STRING)"
+                # Denormalized writes store columns under the transformed name
+                # (core.SchemaTranslator.translate_record); apply the same
+                # transform so the delete predicate targets the real column.
+                physical = transform_column_name(col, **{**transforms, "quote": False})
+                return f"CAST(`{physical}` AS STRING)"
             return f"JSON_VALUE(data, '$.{col}')"
 
         # Reuse the write-path batch size (baserow -> 5000, default fallback

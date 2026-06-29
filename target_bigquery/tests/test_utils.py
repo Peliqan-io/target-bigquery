@@ -804,6 +804,20 @@ def test_flush_denormalized_composite_pk():
     assert _vals(client) == ["1\u001f2"]
 
 
+def test_flush_denormalized_applies_column_transform():
+    # baserow runs BigQuery denormalized with add_underscore_when_invalid, so a
+    # digit-leading key is stored as a `_`-prefixed column; the delete must match.
+    _, client = _run_flush(
+        {"Accounts": [{"123id": "a1"}]},
+        denormalized=True,
+        extra_config={"column_name_transforms": {"add_underscore_when_invalid": True}},
+    )
+    assert _sql(client) == (
+        "DELETE FROM `p`.`d`.`accounts` WHERE CAST(`_123id` AS STRING) IN UNNEST(@vals)"
+    )
+    assert _vals(client) == ["a1"]
+
+
 def test_flush_chunks_by_batch_size():
     records = [{"id": f"a{i}"} for i in range(5)]
     _, client = _run_flush({"Accounts": records}, extra_config={"batch_size": 2})
