@@ -20,7 +20,15 @@ from singer_sdk import typing as th
 from singer_sdk.target_base import Target
 
 from target_bigquery.batch_job import BigQueryBatchJobDenormalizedSink, BigQueryBatchJobSink
-from target_bigquery.core import BaseBigQuerySink, BaseWorker, BigQueryCredentials, ParType
+from google.cloud import bigquery
+
+from target_bigquery.core import (
+    BaseBigQuerySink,
+    BaseWorker,
+    BigQueryCredentials,
+    ParType,
+    bigquery_client_factory,
+)
 from target_bigquery.gcs_stage import BigQueryGcsStagingDenormalizedSink, BigQueryGcsStagingSink
 from target_bigquery.storage_write import (
     BigQueryStorageWriteDenormalizedSink,
@@ -561,6 +569,11 @@ class TargetBigQuery(Target):
                 worker = self.workers.pop()
             for sink in self._sinks_active.values():
                 sink.clean_up()
+            # Apply buffered DELETERECORDs after upserts (clean_up) so an upsert
+            # + delete of the same key in one run ends deleted. Only at
+            # end-of-pipe, so deletes run once with the full buffer.
+            if self._delete_buffer:
+                self._flush_deletes()
         else:
             for worker in self.workers:
                 worker.join()
@@ -569,3 +582,51 @@ class TargetBigQuery(Target):
         if state:
             self._write_state_message(state)
         self._reset_max_record_age()
+
+    def _flush_deletes(self) -> None:
+        """Apply buffered DELETERECORDs as one batched, parameterized DELETE per
+        table. Storage-mode-aware (FIXED -> JSON_VALUE(data,...), DENORMALIZED ->
+        real columns) and best-effort: a failed DELETE is logged, never raised."""
+        client = bigquery_client_factory(self._credentials)
+        denormalized = self.config.get("denormalized", False)
+        project, dataset = self.config["project"], self.config["dataset"]
+        prefix = self.config.get("table_name_prefix", "")
+
+        def accessor(col: str) -> str:
+            # Compare as text: JSON_VALUE returns STRING; CAST aligns typed columns
+            # with the str()-rendered parameter values.
+            if denormalized:
+                return f"CAST(`{col}` AS STRING)"
+            return f"JSON_VALUE(data, '$.{col}')"
+
+        for stream, records in self._delete_buffer.items():
+            if not records:
+                continue
+            name = prefix + stream.lower().replace("-", "_").replace(".", "_")
+            escaped = f"`{project}`.`{dataset}`.`{name}`"
+            cols = list(records[0].keys())  # stable column order across the batch
+
+            if len(cols) == 1:
+                key_expr = accessor(cols[0])
+                vals = [str(r[cols[0]]) for r in records]
+            else:
+                # Composite key: join per-column text with the unit-separator
+                # control char (assumed absent from GUID/int/text key values).
+                key_expr = "CONCAT(" + ", '\\u001f', ".join(accessor(c) for c in cols) + ")"
+                vals = ["\u001f".join(str(r[c]) for c in cols) for r in records]
+
+            sql = f"DELETE FROM {escaped} WHERE {key_expr} IN UNNEST(@vals)"
+            job_config = bigquery.QueryJobConfig(
+                query_parameters=[bigquery.ArrayQueryParameter("vals", "STRING", vals)]
+            )
+            try:
+                client.query(sql, job_config=job_config).result()
+                self.logger.info(
+                    "delete-sync: removed up to %d row(s) from %s", len(vals), name
+                )
+            except Exception as e:  # best-effort: never fail the pipeline on a delete
+                self.logger.warning(
+                    "delete-sync: DELETE failed for %s: %s", name, e
+                )
+
+        self._delete_buffer.clear()
