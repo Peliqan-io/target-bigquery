@@ -372,5 +372,40 @@ class BigQueryStorageWriteSink(BaseBigQuerySink):
         self.commit_streams()
 
 
+def _stringify_json_columns(record: Dict[str, Any], fields: List[Any]) -> Dict[str, Any]:
+    """Serialize values bound for BigQuery JSON columns to strings, recursively.
+
+    The Storage Write API encodes rows as protobuf, and `proto_gen` maps a BigQuery
+    JSON column to a proto STRING field. So a value heading into a JSON column must be
+    a JSON *string* before `json_format.ParseDict`, otherwise it raises
+    `ParseError: expected string ... got 'dict'`. batch_job (NDJSON) does not need this
+    — which is why this lives on the storage_write denormalized sink only."""
+    for field in fields:
+        value = record.get(field.name)
+        if value is None:
+            continue
+        ftype = field.field_type.upper()
+        if ftype == "JSON":
+            if field.mode == "REPEATED" and isinstance(value, list):
+                record[field.name] = [
+                    v if isinstance(v, str) else orjson.dumps(v, default=default).decode("utf-8")
+                    for v in value
+                ]
+            elif not isinstance(value, str):
+                record[field.name] = orjson.dumps(value, default=default).decode("utf-8")
+        elif ftype == "RECORD" and field.fields:
+            items = value if (field.mode == "REPEATED" and isinstance(value, list)) else [value]
+            for item in items:
+                if isinstance(item, dict):
+                    _stringify_json_columns(item, field.fields)
+    return record
+
+
 class BigQueryStorageWriteDenormalizedSink(Denormalized, BigQueryStorageWriteSink):
-    pass
+    def preprocess_record(self, record: Dict[str, Any], context: Dict[str, Any]) -> Dict[str, Any]:
+        # Denormalized.preprocess_record (translate_record) runs first, then we serialize
+        # JSON-typed values to strings so they can be proto-encoded (see helper docstring).
+        record = super().preprocess_record(record, context)
+        return _stringify_json_columns(
+            record, self.table.get_resolved_schema(self.apply_transforms)
+        )
