@@ -56,6 +56,22 @@ MAX_IN_FLIGHT = 15
 Dispatcher = Callable[[types.AppendRowsRequest], writer.AppendRowsFuture]
 StreamComponents = Tuple[str, writer.AppendRowsStream, Dispatcher]
 
+STREAM_OPEN_TIMEOUT = 90.0
+"""How long to wait for the bidi AppendRows stream to open before failing.
+
+The library default is 600s per open attempt. Combined with the tenacity retry
+around send() and the worker's job re-enqueue, a single stuck stream open could
+block the target for hours — observed as an intermittent hang with nested RECORD
+schemas (issue #71). A healthy open takes well under a second, so 90s is generous;
+past that we fail loudly and let the worker recycle the stream on a fresh channel."""
+
+
+class BoundedOpenAppendRowsStream(writer.AppendRowsStream):
+    """AppendRowsStream whose open wait is bounded by STREAM_OPEN_TIMEOUT."""
+
+    def _open(self, initial_request, timeout: float = STREAM_OPEN_TIMEOUT):
+        return super()._open(initial_request, timeout=timeout)
+
 def default(obj):
     if isinstance(obj, decimal.Decimal):
         return float(obj)
@@ -67,7 +83,7 @@ def get_application_stream(client: BigQueryWriteClient, job: "Job") -> StreamCom
     write_stream.type_ = types.WriteStream.Type.PENDING
     write_stream = client.create_write_stream(parent=job.parent, write_stream=write_stream)
     job.template.write_stream = write_stream.name
-    append_rows_stream = writer.AppendRowsStream(client, job.template)
+    append_rows_stream = BoundedOpenAppendRowsStream(client, job.template)
     rv = (write_stream.name, append_rows_stream)
     job.stream_notifier.send(rv)
     return *rv, retry(
@@ -83,7 +99,7 @@ def get_default_stream(client: BigQueryWriteClient, job: "Job") -> StreamCompone
     job.template.write_stream = BigQueryWriteClient.write_stream_path(
         **BigQueryWriteClient.parse_table_path(job.parent), stream="_default"
     )
-    append_rows_stream = writer.AppendRowsStream(client, job.template)
+    append_rows_stream = BoundedOpenAppendRowsStream(client, job.template)
     rv = (job.template.write_stream, append_rows_stream)
     job.stream_notifier.send(rv)
     return *rv, retry(
@@ -192,7 +208,6 @@ class StorageWriteBatchWorker(BaseWorker):
 
     def run(self):
         """Run the worker process."""
-        client: BigQueryWriteClient = storage_client_factory(self.credentials)
         if os.getenv("TARGET_BIGQUERY_DEBUG", "false").lower() == "true":
             bidi_logger = logging.getLogger("google.api_core.bidi")
             bidi_logger.setLevel(logging.DEBUG)
@@ -204,6 +219,13 @@ class StorageWriteBatchWorker(BaseWorker):
             if job is None:
                 break
             if job.parent not in self.cache or self.cache[job.parent][1]._closed:
+                # Each AppendRowsStream gets its own client, i.e. its own gRPC
+                # channel. Opening a second bidi stream on a channel that already
+                # carried one intermittently stalls inside _open() (the issue #71
+                # hang with nested RECORD schemas); a fresh channel opens reliably.
+                # Stream opens are rare (once per table per worker + recycles), so
+                # the extra client is cheap.
+                client: BigQueryWriteClient = storage_client_factory(self.credentials)
                 self.cache[job.parent] = self.get_stream_components(client, job)
                 self.offsets[job.parent] = 0
             write_stream, _, dispatch = cast(StreamComponents, self.cache[job.parent])
