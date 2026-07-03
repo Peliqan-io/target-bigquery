@@ -111,18 +111,49 @@ def generate_request(
     return request
 
 
-def generate_template(message: Type[Message]):
-    """Generate a template for the storage write API from a proto message class."""
+def _self_contained_descriptor(descriptor):
+    """Build a DescriptorProto with every referenced message type embedded as a
+    `nested_type`, so the Storage Write API ProtoSchema is self-contained.
+
+    `proto_gen` generates each RECORD column as a *separate* message that the parent
+    references by name. `generate_template` used to copy only the top-level descriptor,
+    so the Storage Write API could not resolve nested RECORD messages and the stream
+    failed to open — which hangs the target (see z3z1ma/target-bigquery issue #71).
+    This embeds the nested message definitions and rewrites the field type references
+    to point at them, recursively (handles RECORD, REPEATED RECORD and deep nesting)."""
     from google.protobuf import descriptor_pb2
 
-    template, proto_schema, proto_descriptor, proto_data = (
+    def build(desc):
+        proto = descriptor_pb2.DescriptorProto()
+        desc.CopyToProto(proto)
+        embedded: Dict[str, str] = {}  # message full_name -> local nested_type name
+        for i, fld in enumerate(desc.fields):
+            if fld.message_type is None:
+                continue
+            full_name = fld.message_type.full_name
+            if full_name not in embedded:
+                nested = build(fld.message_type)  # recurse first (handles deep nesting)
+                nested.name = "record_%d" % (len(embedded) + 1)  # unique within this scope
+                proto.nested_type.add().MergeFrom(nested)
+                embedded[full_name] = nested.name
+            # relative type ref -> resolved to the embedded nested_type in this scope
+            proto.field[i].type_name = embedded[full_name]
+        return proto
+
+    return build(descriptor)
+
+
+def generate_template(message: Type[Message]):
+    """Generate a template for the storage write API from a proto message class."""
+    template, proto_schema, proto_data = (
         types.AppendRowsRequest(),
         types.ProtoSchema(),
-        descriptor_pb2.DescriptorProto(),
         types.AppendRowsRequest.ProtoData(),
     )
-    message.DESCRIPTOR.CopyToProto(proto_descriptor)
-    proto_schema.proto_descriptor = proto_descriptor
+    # Embed nested (RECORD) message definitions so the schema is self-contained;
+    # otherwise the Storage Write API can't resolve nested types, the stream fails
+    # to open, and the target hangs (issue #71).
+    proto_schema.proto_descriptor = _self_contained_descriptor(message.DESCRIPTOR)
     proto_data.writer_schema = proto_schema
     template.proto_rows = proto_data
     return template
