@@ -533,13 +533,28 @@ class TargetBigQuery(Target):
             while len(self.workers):
                 worker.join()
                 worker = self.workers.pop()
+            self._raise_pending_worker_error()
             for sink in self._sinks_active.values():
                 sink.clean_up()
         else:
             for worker in self.workers:
                 worker.join()
+            self._raise_pending_worker_error()
             for sink in self._sinks_active.values():
                 sink.pre_state_hook()
         if state:
             self._write_state_message(state)
         self._reset_max_record_age()
+
+    def _raise_pending_worker_error(self) -> None:
+        """Surface worker errors that arrived after the last drain_one poll.
+
+        Workers report failures (e.g. a record too large for any AppendRows
+        request, or a job that exhausted its retries) via the error notifier,
+        which is normally polled in drain_one. Errors raised on the final jobs
+        land after that last poll — without this check the target would exit 0
+        and write a state message while rows were silently dropped."""
+        if self.error_notification.poll() and self.config.get("fail_fast", True):
+            e, msg = self.error_notification.recv()
+            self.logger.error(msg)
+            raise RuntimeError(msg) from e
