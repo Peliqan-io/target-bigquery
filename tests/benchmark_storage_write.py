@@ -13,6 +13,9 @@ Scenarios
                -> expects EVERY batch to split into 2 AppendRows requests
     documents  small rows + big documents (up to 18 MB) + oversized (25 MB)
                -> expects splitting AND the >19.5 MB Load Job fallback
+    multitable 10 tables in one sync, records interleaved round-robin
+               (--rows is PER TABLE; --rows 1000000 = the full 10 x 1M run)
+               -> one worker, 10 open AppendRows streams, per-table verification
 
 Usage (from the repo root, inside the poetry env):
 
@@ -118,8 +121,11 @@ def make_wide(workdir: Path, rows: int):
     fixture = workdir / "wide.jsonl"
     with open(fixture, "w") as fh:
         gen_throughput_150key.gen(rows, fh)
-    # 20k rows x ~1.1 KB proto ≈ 22 MB per batch -> every full batch must split
-    return fixture, gen_throughput_150key.STREAM, {"splits": (">=", 1), "fallback": ("==", 0)}
+    # 20k rows x ~1.1 KB proto ≈ 22 MB per batch -> every FULL batch must split.
+    # Below one full batch (rows < batch_size) the whole run fits one request,
+    # so no split is the correct outcome — expect accordingly.
+    splits_expect = (">=", 1) if rows >= 20_000 else ("==", 0)
+    return fixture, gen_throughput_150key.STREAM, {"splits": splits_expect, "fallback": ("==", 0)}
 
 
 def make_documents(workdir: Path, rows: int):
@@ -129,8 +135,28 @@ def make_documents(workdir: Path, rows: int):
     return fixture, "documents", {"splits": (">=", 1), "fallback": (">=", 1)}
 
 
-SCENARIOS = {"exact": make_exact, "wide": make_wide, "documents": make_documents}
-DEFAULT_ROWS = {"exact": 200_000, "wide": 100_000, "documents": 0}
+MULTITABLE_STREAMS = 10
+
+
+def make_multitable(workdir: Path, rows: int):
+    """10 tables loaded in one sync, records interleaved round-robin — the
+    harshest stream-switching pattern: one worker holds an open AppendRows
+    stream per table and batches from different tables land back-to-back.
+    `rows` is PER TABLE (use --rows 1000000 for the full 10 x 1M run)."""
+    fixture = workdir / "multitable.jsonl"
+    with open(fixture, "w") as fh:
+        gen_exact_online.gen(rows, fh, num_streams=MULTITABLE_STREAMS)
+    streams = gen_exact_online.stream_names(MULTITABLE_STREAMS)
+    return fixture, streams, {"splits": ("==", 0), "fallback": ("==", 0)}
+
+
+SCENARIOS = {
+    "exact": make_exact,
+    "wide": make_wide,
+    "documents": make_documents,
+    "multitable": make_multitable,
+}
+DEFAULT_ROWS = {"exact": 200_000, "wide": 100_000, "documents": 0, "multitable": 50_000}
 
 
 # --------------------------------------------------------------------------- #
@@ -170,20 +196,26 @@ def main():
         rows = args.rows or DEFAULT_ROWS[name]
         print(f"\n=== {name}: generating fixture ...", flush=True)
         fixture, stream, expect = SCENARIOS[name](workdir, rows)
+        streams = [stream] if isinstance(stream, str) else stream
         size_mb = fixture.stat().st_size / 1024 / 1024
         n_records = sum(1 for line in open(fixture) if '"type": "RECORD"' in line
                         or '"type":"RECORD"' in line)
-        before = table_count(client, cfg, stream)
+        before = {s: table_count(client, cfg, s) for s in streams}
 
         log = workdir / f"_bench_{name}.log"
         print(f"=== {name}: loading {n_records:,} records ({size_mb:.0f} MB) "
-              f"through target-bigquery ...", flush=True)
+              f"through target-bigquery ({len(streams)} table(s)) ...", flush=True)
         elapsed = run_target(bench_config, fixture, log)
 
         metrics = parse_log(log)
-        delta = table_count(client, cfg, stream) - before
+        deltas = {s: table_count(client, cfg, s) - before[s] for s in streams}
+        delta = sum(deltas.values())
         verdict = check(expect, metrics)
-        if delta != n_records:
+        per_table = n_records // len(streams)
+        bad_tables = {s: d for s, d in deltas.items() if d != per_table}
+        if bad_tables:
+            verdict = f"FAIL (per-table deltas off: {bad_tables})"
+        elif delta != n_records:
             verdict = f"FAIL (bq_delta={delta:,}, expected {n_records:,})"
         if name != "documents" and (n_records / elapsed) * 60 < TICKET_MIN_ROWS_PER_MIN:
             verdict = f"FAIL (below {TICKET_MIN_ROWS_PER_MIN:,} rows/min ticket target)"
