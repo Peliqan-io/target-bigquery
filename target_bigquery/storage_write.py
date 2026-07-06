@@ -53,6 +53,50 @@ logger = logging.getLogger(__name__)
 MAX_IN_FLIGHT = 15
 """Maximum number of concurrent requests per worker be processed by grpc before awaiting."""
 
+MAX_REQUEST_BYTES = 19_500_000
+"""Byte budget for a single AppendRows request payload.
+
+The Storage Write API hard-caps each AppendRows request at 20 MB. 19.5 decimal MB
+stays under the cap whichever way Google means it (20,000,000 or 20,971,520 bytes)
+and leaves headroom for the request envelope and, on the first request of a stream,
+the writer-schema descriptor merged in from the template. Overridable per pipeline
+via `options.max_request_bytes`."""
+
+PER_ROW_OVERHEAD = 8
+"""Conservative per-row proto framing cost inside ProtoRows (tag byte + length varint)."""
+
+
+class RecordTooLargeError(ValueError):
+    """A single serialized row exceeds the AppendRows request budget.
+
+    Such a row can never be sent via the Storage Write API, so retrying is
+    pointless — the worker reports it straight to the error notifier instead of
+    re-enqueueing. (Planned follow-up: divert these rows to a Load Job fallback
+    in the sink before they ever reach the queue.)"""
+
+
+def chunk_proto_rows(rows: types.ProtoRows, limit: int = MAX_REQUEST_BYTES):
+    """Split ProtoRows into chunks whose payload stays under the request budget.
+
+    Rows are already serialized, so sizes are exact; order is preserved. Yields
+    the original ProtoRows untouched when everything fits in one request."""
+    chunk, size = types.ProtoRows(), 0
+    for row in rows.serialized_rows:
+        row_size = len(row) + PER_ROW_OVERHEAD
+        if row_size > limit:
+            raise RecordTooLargeError(
+                f"A single record serializes to {row_size} bytes, which exceeds the "
+                f"AppendRows request budget of {limit} bytes. It cannot be loaded via "
+                "the Storage Write API."
+            )
+        if size + row_size > limit:
+            yield chunk
+            chunk, size = types.ProtoRows(), 0
+        chunk.serialized_rows.append(row)
+        size += row_size
+    if chunk.serialized_rows:
+        yield chunk
+
 Dispatcher = Callable[[types.AppendRowsRequest], writer.AppendRowsFuture]
 StreamComponents = Tuple[str, writer.AppendRowsStream, Dispatcher]
 
@@ -196,6 +240,8 @@ class Job():
 class StorageWriteBatchWorker(BaseWorker):
     """Worker process for the storage write API."""
 
+    max_request_bytes: int = MAX_REQUEST_BYTES
+
     def __init__(self, *args, **kwargs):
         """Initialize the worker process."""
         super().__init__(*args, **kwargs)
@@ -229,16 +275,44 @@ class StorageWriteBatchWorker(BaseWorker):
                 self.cache[job.parent] = self.get_stream_components(client, job)
                 self.offsets[job.parent] = 0
             write_stream, _, dispatch = cast(StreamComponents, self.cache[job.parent])
-           
+
             try:
-                kwargs = {}
+                kwargs = {"offset": None, "path": None}
                 if write_stream.endswith("_default"):
-                    kwargs["offset"] = None
                     kwargs["path"] = write_stream
-                else:
-                    kwargs["offset"] = self.offsets[job.parent]
-                self.awaiting.append(dispatch(generate_request(job.data, **kwargs)))
-                
+                # Split the batch so every AppendRows request stays under the API's
+                # 20 MB cap. Offsets advance per chunk (application streams need the
+                # exact running offset); backpressure applies inside the loop so a
+                # multi-chunk job cannot flood the in-flight window.
+                # logger (not log_notifier): notifier messages are only drained during
+                # drain_one, so end-of-pipe activity would be invisible in the logs.
+                chunks = list(chunk_proto_rows(job.data, self.max_request_bytes))
+                if len(chunks) > 1:
+                    total_bytes = sum(len(r) for r in job.data.serialized_rows)
+                    self.logger.info(
+                        f"[{self.ext_id}] Batch of {len(job.data.serialized_rows)} rows"
+                        f" ({total_bytes:,} bytes) for {job.parent} exceeds"
+                        f" max_request_bytes={self.max_request_bytes:,};"
+                        f" splitting into {len(chunks)} AppendRows requests."
+                    )
+                for idx, chunk in enumerate(chunks, 1):
+                    if not write_stream.endswith("_default"):
+                        kwargs["offset"] = self.offsets[job.parent]
+                    self.awaiting.append(dispatch(generate_request(chunk, **kwargs)))
+                    nrows = len(chunk.serialized_rows)
+                    chunk_bytes = sum(len(r) for r in chunk.serialized_rows)
+                    self.logger.info(
+                        f"[{self.ext_id}] Sent request {idx}/{len(chunks)}:"
+                        f" {nrows} rows ({chunk_bytes:,} bytes) to {write_stream}"
+                        f" with offset {self.offsets[job.parent]}."
+                    )
+                    self.offsets[job.parent] += nrows
+                    if len(self.awaiting) > MAX_IN_FLIGHT:
+                        self.wait()
+            except RecordTooLargeError as exc:
+                # Deterministic failure — retrying cannot help, report immediately.
+                self.logger.error(f"[{self.ext_id}] {exc}")
+                self.error_notifier.send((exc, self.serialize_exception(exc)))
             except Exception as exc:
                 job.attempts += 1
                 self.logger.info(f"job.attempts : {job.attempts}")
@@ -257,14 +331,6 @@ class StorageWriteBatchWorker(BaseWorker):
                     self.wait(drain=True)
                     self.close_cached_streams()
                     raise
-            else:
-                self.log_notifier.send(
-                    f"[{self.ext_id}] Sent {len(job.data.serialized_rows)} rows to {write_stream}"
-                    f" with offset {self.offsets[job.parent]}."
-                )
-                self.offsets[job.parent] += len(job.data.serialized_rows)
-                if len(self.awaiting) > MAX_IN_FLIGHT:
-                    self.wait()
             finally:
                 self.queue.task_done()
         # Wait for all in-flight requests to complete after poison pill
@@ -336,6 +402,9 @@ class BigQueryStorageWriteSink(BaseBigQuerySink):
             Worker = type("Worker", (StorageWriteBatchWorker, worker_executor_cls), {})
         else:
             Worker = type("Worker", (StorageWriteStreamWorker, worker_executor_cls), {})
+        Worker.max_request_bytes = int(
+            config.get("options", {}).get("max_request_bytes", MAX_REQUEST_BYTES)
+        )
         return Worker
 
     def __init__(
@@ -346,6 +415,13 @@ class BigQueryStorageWriteSink(BaseBigQuerySink):
         key_properties: Optional[List[str]],
     ) -> None:
         super().__init__(target, stream_name, schema, key_properties)
+        # Queue-depth cap for the process_batch backpressure loop. Each queued Job
+        # holds a full batch of serialized rows in memory, so the Peliqan runtime
+        # profile (1 worker / 20k-row batches) sets options.max_jobs_queued=1 to
+        # bound memory to roughly one in-flight batch + one queued batch.
+        self.MAX_JOBS_QUEUED = int(
+            self.config.get("options", {}).get("max_jobs_queued", self.MAX_JOBS_QUEUED)
+        )
         self.open_streams: Set[Tuple[str, writer.AppendRowsStream]] = set()
         self.parent = BigQueryWriteClient.table_path(
             self.table.project,
