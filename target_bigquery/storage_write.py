@@ -13,6 +13,7 @@ Throughput test: 11m 0s @ 1M rows / 150 keys / 1.5GB
 NOTE: This is naive and will vary drastically based on network speed, for example on a GCP VM.
 """
 import os
+from io import BytesIO
 from time import sleep
 from multiprocessing import Process
 from multiprocessing.connection import Connection
@@ -34,6 +35,7 @@ from typing import (
 )
 
 import orjson, decimal
+from google.cloud import bigquery
 from google.cloud.bigquery_storage_v1 import BigQueryWriteClient, types, writer
 from google.protobuf import json_format
 from proto import Message
@@ -44,7 +46,14 @@ if TYPE_CHECKING:
 
 import logging
 
-from target_bigquery.core import BaseBigQuerySink, BaseWorker, Denormalized, storage_client_factory
+from target_bigquery.core import (
+    BaseBigQuerySink,
+    BaseWorker,
+    Compressor,
+    Denormalized,
+    bigquery_client_factory,
+    storage_client_factory,
+)
 from target_bigquery.proto_gen import proto_schema_factory_v2
 
 logger = logging.getLogger(__name__)
@@ -422,6 +431,16 @@ class BigQueryStorageWriteSink(BaseBigQuerySink):
         self.MAX_JOBS_QUEUED = int(
             self.config.get("options", {}).get("max_jobs_queued", self.MAX_JOBS_QUEUED)
         )
+        # Load Job fallback for records too large for any AppendRows request:
+        # detected in process_record, buffered as NDJSON, flushed one Load Job
+        # per batch into the same table. Rare by definition, so the load-job
+        # quota cost is negligible.
+        self.max_request_bytes = int(
+            self.config.get("options", {}).get("max_request_bytes", MAX_REQUEST_BYTES)
+        )
+        self._fallback_buffer: Optional[Compressor] = None
+        self._fallback_rows = 0
+        self._fallback_jobs: List[bigquery.LoadJob] = []
         self.open_streams: Set[Tuple[str, writer.AppendRowsStream]] = set()
         self.parent = BigQueryWriteClient.table_path(
             self.table.project,
@@ -448,15 +467,79 @@ class BigQueryStorageWriteSink(BaseBigQuerySink):
         return record
 
     def process_record(self, record: Dict[str, Any], context: Dict[str, Any]) -> None:
-        self.proto_rows.serialized_rows.append(
-            json_format.ParseDict(record, self.proto_schema()).SerializeToString()
+        data = json_format.ParseDict(record, self.proto_schema()).SerializeToString()
+        if len(data) + PER_ROW_OVERHEAD > self.max_request_bytes:
+            # Too large for any AppendRows request — divert to the Load Job fallback
+            # instead of poisoning the batch (the worker would reject the whole job).
+            self._buffer_oversized_record(record, len(data))
+            return
+        self.proto_rows.serialized_rows.append(data)
+
+    @property
+    def fallback_job_config(self) -> Dict[str, Any]:
+        """LoadJobConfig kwargs for the oversized-record fallback (mirrors batch_job)."""
+        return {
+            "schema": self.table.get_resolved_schema(),
+            "source_format": bigquery.SourceFormat.NEWLINE_DELIMITED_JSON,
+            "write_disposition": bigquery.WriteDisposition.WRITE_APPEND,
+        }
+
+    def _buffer_oversized_record(self, record: Dict[str, Any], size: int) -> None:
+        if self._fallback_buffer is None:
+            self._fallback_buffer = Compressor()
+        # The record was stringified for proto encoding; a Load Job wants raw JSON
+        # values in JSON columns, so reverse it (only these rare rows pay for this).
+        row = _destringify_json_columns(
+            record, self.table.get_resolved_schema(self.apply_transforms)
         )
+        self._fallback_buffer.write(
+            orjson.dumps(row, option=orjson.OPT_APPEND_NEWLINE, default=default)
+        )
+        self._fallback_rows += 1
+        self.logger.info(
+            f"Record of {size:,} bytes exceeds max_request_bytes"
+            f"={self.max_request_bytes:,}; diverting to Load Job fallback"
+            f" for {self.table.as_ref()}."
+        )
+
+    def _flush_fallback_buffer(self) -> None:
+        if self._fallback_buffer is None:
+            return
+        self._fallback_buffer.close()
+        client = bigquery_client_factory(self._credentials)
+        self._fallback_jobs.append(
+            client.load_table_from_file(
+                BytesIO(self._fallback_buffer.getvalue()),
+                self.table.as_ref(),
+                num_retries=3,
+                job_config=bigquery.LoadJobConfig(**self.fallback_job_config),
+            )
+        )
+        self.logger.info(
+            f"Submitted Load Job fallback with {self._fallback_rows} oversized"
+            f" record(s) for {self.table.as_ref()}."
+        )
+        self._fallback_buffer = None
+        self._fallback_rows = 0
+
+    def _wait_for_fallback_jobs(self) -> None:
+        """Block until fallback Load Jobs finish — called before state is written."""
+        self._flush_fallback_buffer()
+        while self._fallback_jobs:
+            job = self._fallback_jobs.pop()
+            try:
+                job.result()
+            except Exception:
+                self.logger.error(
+                    f"Load Job fallback failed for {self.table.as_ref()}: {job.errors}"
+                )
+                raise
 
     def process_batch(self, context: Dict[str, Any]) -> None:
         while self.global_queue.qsize() >= self.MAX_JOBS_QUEUED:
             self.logger.warn(f"Max jobs enqueued reached ({self.MAX_JOBS_QUEUED})")
             sleep(1)
-        
+
         self.global_queue.put(
             Job(
                 parent=self.parent,
@@ -466,6 +549,9 @@ class BigQueryStorageWriteSink(BaseBigQuerySink):
             )
         )
         self.increment_jobs_enqueued()
+        # Upload any oversized rows collected during this batch (non-blocking:
+        # completion is awaited in pre_state_hook/clean_up).
+        self._flush_fallback_buffer()
 
     def commit_streams(self) -> None:
         while self.stream_notification.poll():
@@ -495,10 +581,12 @@ class BigQueryStorageWriteSink(BaseBigQuerySink):
 
     def clean_up(self) -> None:
         self.commit_streams()
+        self._wait_for_fallback_jobs()
         super().clean_up()
 
     def pre_state_hook(self) -> None:
         self.commit_streams()
+        self._wait_for_fallback_jobs()
 
 
 def _stringify_json_columns(record: Dict[str, Any], fields: List[Any]) -> Dict[str, Any]:
@@ -530,7 +618,54 @@ def _stringify_json_columns(record: Dict[str, Any], fields: List[Any]) -> Dict[s
     return record
 
 
+def _destringify_json_columns(record: Dict[str, Any], fields: List[Any]) -> Dict[str, Any]:
+    """Inverse of _stringify_json_columns, for the Load Job fallback path.
+
+    NDJSON Load Jobs expect raw JSON values in JSON columns; the record reaching
+    process_record has them serialized to strings for proto encoding. A string
+    that fails to parse is left untouched (it was a genuine string value)."""
+    for field in fields:
+        value = record.get(field.name)
+        if value is None:
+            continue
+        ftype = field.field_type.upper()
+        if ftype == "JSON":
+            if field.mode == "REPEATED" and isinstance(value, list):
+                record[field.name] = [_maybe_json_loads(v) for v in value]
+            else:
+                record[field.name] = _maybe_json_loads(value)
+        elif ftype == "RECORD" and field.fields:
+            items = value if (field.mode == "REPEATED" and isinstance(value, list)) else [value]
+            for item in items:
+                if isinstance(item, dict):
+                    _destringify_json_columns(item, field.fields)
+    return record
+
+
+def _maybe_json_loads(value: Any) -> Any:
+    if isinstance(value, str):
+        try:
+            return orjson.loads(value)
+        except orjson.JSONDecodeError:
+            return value
+    return value
+
+
 class BigQueryStorageWriteDenormalizedSink(Denormalized, BigQueryStorageWriteSink):
+    @property
+    def fallback_job_config(self) -> Dict[str, Any]:
+        # Mirrors BigQueryBatchJobDenormalizedSink.job_config so fallback rows get
+        # the same load semantics as the batch_job path.
+        return {
+            "schema": self.table.get_resolved_schema(),
+            "source_format": bigquery.SourceFormat.NEWLINE_DELIMITED_JSON,
+            "write_disposition": bigquery.WriteDisposition.WRITE_APPEND,
+            "schema_update_options": [
+                bigquery.SchemaUpdateOption.ALLOW_FIELD_ADDITION,
+            ],
+            "ignore_unknown_values": True,
+        }
+
     def preprocess_record(self, record: Dict[str, Any], context: Dict[str, Any]) -> Dict[str, Any]:
         # Denormalized.preprocess_record (translate_record) runs first, then we serialize
         # JSON-typed values to strings so they can be proto-encoded (see helper docstring).
