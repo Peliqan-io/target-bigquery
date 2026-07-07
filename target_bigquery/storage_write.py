@@ -125,6 +125,23 @@ class BoundedOpenAppendRowsStream(writer.AppendRowsStream):
     def _open(self, initial_request, timeout: float = STREAM_OPEN_TIMEOUT):
         return super()._open(initial_request, timeout=timeout)
 
+    def _on_response(self, response):
+        # On a failed append the library keeps only the status message ("Please
+        # refer to the row_errors field for details") and discards
+        # response.row_errors — the only record of WHICH rows failed and WHY.
+        # Log them here, before delegating, so failures are diagnosable.
+        if response.error.code and response.row_errors:
+            errs = list(response.row_errors)
+            detail = "; ".join(
+                f"row[{err.index}] {types.RowError.RowErrorCode(err.code).name}: {err.message}"
+                for err in errs[:10]
+            )
+            logger.error(
+                f"AppendRows failed with {len(errs)} row_errors"
+                f" (first {min(len(errs), 10)}): {detail}"
+            )
+        super()._on_response(response)
+
 def default(obj):
     if isinstance(obj, decimal.Decimal):
         return float(obj)
