@@ -23,23 +23,35 @@ Usage (from the repo root, inside the poetry env):
     poetry run python tests/benchmark_storage_write.py --config my_config.json \
         --scenario wide --rows 1000000          # full upstream-comparable run
 
-The config is a normal target-bigquery config (project/credentials_json/dataset/
-denormalized). The harness forces the Peliqan runtime profile on top of it:
-method=storage_write_api, batch_size=20000, max_workers=1, max_jobs_queued=1.
+    # REGRESSION MODE — run every scenario through BOTH load mechanisms into
+    # separately named tables (rtHHMMSS_lj_* vs rtHHMMSS_sw_*), then verify the
+    # table CONTENTS are identical (FARM_FINGERPRINT over all non-_sdc columns)
+    # and compare speed + API-operation counts side by side:
+    poetry run python tests/benchmark_storage_write.py --config my_config.json \
+        --methods batch_job,storage_write_api
 
-Default row counts keep the whole suite under ~5 minutes; use --rows to scale
-(applies to exact and wide; documents is sized by its doc mix).
+The config is a normal target-bigquery config (project/credentials_json/dataset/
+denormalized). The harness overlays the Peliqan runtime profile per leg:
+batch_size=20000, max_workers=1 (+ max_jobs_queued=1 for storage_write_api).
+
+Every run writes to fresh tables under a unique rtHHMMSS_ prefix and DELETES
+them at the end — pass --keep-tables to inspect them afterwards.
+
+Default row counts keep the single-method suite under ~5 minutes; use --rows to
+scale (applies per table for exact/wide/multitable; documents is sized by its
+doc mix).
 
 Sample report:
 
-    scenario    rows      MB     time    rows/min    MB/min  requests  splits  fallback  bq_delta  result
-    exact       200,000   170    62.1s   193,246     164     10        0       0         200,000   PASS
-    wide        100,000   167    81.4s   73,710      123     10        5       0         100,000   PASS
-    documents   2,020     136    97.0s   1,249       84      9         3       1         2,020     PASS
+    scenario    rows      MB     time    rows/min    MB/min  api_ops  splits  fallback  bq_rows   result
+    exact       200,000   170    62.1s   193,246     164     10       0       0         200,000   PASS
+    wide        100,000   167    81.4s   73,710      123     10       5       0         100,000   PASS
+    documents   2,020     136    97.0s   1,249       84      9        3       1         2,020     PASS
 
-Tables are created as <table_name_prefix><stream> in the configured dataset and
-are left in place for inspection (row counts are measured as before/after deltas,
-so re-runs are fine).
+Tables are created as <table_name_prefix><stream> in the configured dataset,
+row counts are verified against the fixture, and (in regression mode) contents
+are fingerprint-compared across methods. All of the run's tables are deleted
+at the end — even if a leg fails mid-run — unless --keep-tables is passed.
 """
 import argparse
 import json
@@ -97,13 +109,54 @@ def run_target(config_path: Path, fixture: Path, log: Path) -> float:
     return elapsed
 
 
-def parse_log(log: Path):
+def parse_log(log: Path, method: str):
     text = log.read_text()
+    if method == "batch_job":
+        api_ops = text.count("] Loaded ")          # one per Load Job
+    else:
+        api_ops = text.count("] Sent request ")    # one per AppendRows request
     return {
-        "requests": text.count("] Sent request "),
+        "api_ops": api_ops,
         "splits": text.count("; splitting into "),
         "fallback": text.count("diverting to Load Job fallback"),
     }
+
+
+METHOD_TAG = {"batch_job": "lj", "storage_write_api": "sw"}
+
+
+def leg_config(base_cfg: dict, method: str, run_prefix: str) -> dict:
+    """Overlay the base config for one comparison leg, isolated by table prefix."""
+    cfg = json.loads(json.dumps(base_cfg))  # deep copy
+    cfg["method"] = method
+    cfg["batch_size"] = 20_000
+    cfg["table_name_prefix"] = f"{run_prefix}{METHOD_TAG[method]}_"
+    options = {"max_workers": 1}
+    if method == "storage_write_api":
+        options["max_jobs_queued"] = 1
+    cfg["options"] = options
+    return cfg
+
+
+def full_table(cfg: dict, stream: str) -> str:
+    return f"{cfg['dataset']}.{cfg.get('table_name_prefix', '')}{stream}"
+
+
+def fingerprint(client, cfg: dict, stream: str):
+    """(row_count, content_fingerprint) over all non-_sdc columns of a table.
+
+    FARM_FINGERPRINT over TO_JSON_STRING of the source columns — equal counts
+    AND equal fingerprint sums mean the two tables hold identical data.
+    Summed as BIGNUMERIC: INT64 SUM overflows on ~100k random 64-bit values."""
+    table = full_table(cfg, stream)
+    cols = [f.name for f in client.get_table(table).schema
+            if not f.name.startswith("_sdc")]
+    struct = ", ".join(f"`{c}`" for c in cols)
+    q = (f"SELECT COUNT(*) AS n, "
+         f"SUM(CAST(FARM_FINGERPRINT(TO_JSON_STRING(STRUCT({struct}))) AS BIGNUMERIC)) AS fp "
+         f"FROM `{table}`")
+    row = list(client.query(q).result())[0]
+    return row.n, row.fp
 
 
 # --------------------------------------------------------------------------- #
@@ -176,22 +229,58 @@ def main():
     ap.add_argument("--config", required=True, help="target-bigquery config JSON")
     ap.add_argument("--scenario", choices=[*SCENARIOS, "all"], default="all")
     ap.add_argument("--rows", type=int, default=None,
-                    help="row count for exact/wide (defaults: 200k / 100k)")
+                    help="row count for exact/wide/multitable (per table)")
+    ap.add_argument("--methods", default="storage_write_api",
+                    help="comma list: storage_write_api,batch_job — passing both "
+                         "runs each scenario through each method into separate "
+                         "tables and verifies the contents MATCH (regression mode)")
+    ap.add_argument("--keep-tables", action="store_true",
+                    help="keep the run's tables instead of deleting them at the end")
     args = ap.parse_args()
 
-    cfg = json.loads(Path(args.config).read_text())
-    cfg.update({"method": "storage_write_api", "batch_size": 20_000})
-    cfg.setdefault("options", {}).update({"max_workers": 1, "max_jobs_queued": 1})
+    methods = [m.strip() for m in args.methods.split(",") if m.strip()]
+    for m in methods:
+        if m not in METHOD_TAG:
+            sys.exit(f"unknown method {m!r} (choose from {list(METHOD_TAG)})")
 
+    base_cfg = json.loads(Path(args.config).read_text())
+    run_prefix = time.strftime("rt%H%M%S_")  # isolates this run's tables
     workdir = TESTS_DIR / "local_fixtures"
     workdir.mkdir(exist_ok=True)
-    bench_config = workdir / "_bench_config.json"
-    bench_config.write_text(json.dumps(cfg))
+    client = bq_client(base_cfg)
 
-    client = bq_client(cfg)
     todo = list(SCENARIOS) if args.scenario == "all" else [args.scenario]
     results = []
+    created_tables = []
 
+    try:
+        run_scenarios(args, methods, base_cfg, run_prefix, workdir, client,
+                      todo, results, created_tables)
+    finally:
+        # delete the run's tables even when a leg crashes or exits mid-run
+        if args.keep_tables:
+            print(f"Tables kept (prefix {run_prefix}*): {len(set(created_tables))}")
+        else:
+            for t in sorted(set(created_tables)):
+                client.delete_table(t, not_found_ok=True)
+            print(f"Cleaned up {len(set(created_tables))} table(s) (prefix {run_prefix}*).")
+
+    cols = list(results[0].keys())
+    widths = {c: max(len(c), *(len(str(r[c])) for r in results)) for c in cols}
+    print("\n" + "  ".join(c.ljust(widths[c]) for c in cols))
+    for r in results:
+        print("  ".join(str(r[c]).ljust(widths[c]) for c in cols))
+    print(f"\nProfile: batch_size=20000 · 1 worker (+ max_jobs_queued=1 on storage_write)."
+          f"\nTicket target: {TICKET_MIN_ROWS_PER_MIN:,}+ rows/min (regular rows)."
+          f"\napi_ops: Load Jobs consume the 1.5k/table/day quota; AppendRows do not.")
+
+    any_fail = any("FAIL" in r["result"] for r in results)
+    if any_fail:
+        sys.exit(1)
+
+
+def run_scenarios(args, methods, base_cfg, run_prefix, workdir, client,
+                  todo, results, created_tables):
     for name in todo:
         rows = args.rows or DEFAULT_ROWS[name]
         print(f"\n=== {name}: generating fixture ...", flush=True)
@@ -200,48 +289,63 @@ def main():
         size_mb = fixture.stat().st_size / 1024 / 1024
         n_records = sum(1 for line in open(fixture) if '"type": "RECORD"' in line
                         or '"type":"RECORD"' in line)
-        before = {s: table_count(client, cfg, s) for s in streams}
-
-        log = workdir / f"_bench_{name}.log"
-        print(f"=== {name}: loading {n_records:,} records ({size_mb:.0f} MB) "
-              f"through target-bigquery ({len(streams)} table(s)) ...", flush=True)
-        elapsed = run_target(bench_config, fixture, log)
-
-        metrics = parse_log(log)
-        deltas = {s: table_count(client, cfg, s) - before[s] for s in streams}
-        delta = sum(deltas.values())
-        verdict = check(expect, metrics)
         per_table = n_records // len(streams)
-        bad_tables = {s: d for s, d in deltas.items() if d != per_table}
-        if bad_tables:
-            verdict = f"FAIL (per-table deltas off: {bad_tables})"
-        elif delta != n_records:
-            verdict = f"FAIL (bq_delta={delta:,}, expected {n_records:,})"
-        if name != "documents" and (n_records / elapsed) * 60 < TICKET_MIN_ROWS_PER_MIN:
-            verdict = f"FAIL (below {TICKET_MIN_ROWS_PER_MIN:,} rows/min ticket target)"
+        leg_cfgs = {}
 
-        results.append({
-            "scenario": name, "rows": n_records, "MB": round(size_mb),
-            "time": f"{elapsed:.1f}s",
-            "rows/min": f"{n_records / elapsed * 60:,.0f}",
-            "MB/min": f"{size_mb / elapsed * 60:,.0f}",
-            "requests": metrics["requests"], "splits": metrics["splits"],
-            "fallback": metrics["fallback"], "bq_delta": f"{delta:,}",
-            "result": verdict,
-        })
-        print(f"=== {name}: {verdict} · {elapsed:.1f}s · log: {log}")
+        for method in methods:
+            cfg = leg_config(base_cfg, method, run_prefix)
+            leg_cfgs[method] = cfg
+            cfg_path = workdir / f"_bench_config_{METHOD_TAG[method]}.json"
+            cfg_path.write_text(json.dumps(cfg))
+            created_tables += [full_table(cfg, s) for s in streams]
 
-    cols = list(results[0].keys())
-    widths = {c: max(len(c), *(len(str(r[c])) for r in results)) for c in cols}
-    print("\n" + "  ".join(c.ljust(widths[c]) for c in cols))
-    for r in results:
-        print("  ".join(str(r[c]).ljust(widths[c]) for c in cols))
-    print("\nProfile: storage_write_api · batch_size=20000 · 1 worker · 1 queued batch"
-          f"\nTicket target: {TICKET_MIN_ROWS_PER_MIN:,}+ rows/min (regular rows)."
-          "\nTables were appended in the configured dataset; safe to re-run (deltas).")
+            log = workdir / f"_bench_{name}_{METHOD_TAG[method]}.log"
+            print(f"=== {name} [{method}]: loading {n_records:,} records "
+                  f"({size_mb:.0f} MB, {len(streams)} table(s)) ...", flush=True)
+            elapsed = run_target(cfg_path, fixture, log)
 
-    if any("FAIL" in r["result"] for r in results):
-        sys.exit(1)
+            metrics = parse_log(log, method)
+            # splitter/fallback are storage_write mechanisms; batch_job has neither
+            leg_expect = expect if method == "storage_write_api" else {
+                "splits": ("==", 0), "fallback": ("==", 0)}
+            verdict = check(leg_expect, metrics)
+            deltas = {s: table_count(client, cfg, s) for s in streams}  # fresh tables
+            bad = {s: d for s, d in deltas.items() if d != per_table}
+            if bad:
+                verdict = f"FAIL (per-table rows off: {bad})"
+            if (name != "documents"
+                    and (n_records / elapsed) * 60 < TICKET_MIN_ROWS_PER_MIN):
+                verdict = f"FAIL (below {TICKET_MIN_ROWS_PER_MIN:,} rows/min)"
+
+            results.append({
+                "scenario": name, "method": method, "rows": n_records,
+                "MB": round(size_mb), "time": f"{elapsed:.1f}s",
+                "rows/min": f"{n_records / elapsed * 60:,.0f}",
+                "MB/min": f"{size_mb / elapsed * 60:,.0f}",
+                "api_ops": metrics["api_ops"], "splits": metrics["splits"],
+                "fallback": metrics["fallback"],
+                "bq_rows": f"{sum(deltas.values()):,}",
+                "match": "", "result": verdict,
+            })
+            print(f"=== {name} [{method}]: {verdict} · {elapsed:.1f}s · log: {log}")
+
+        # cross-method equivalence: identical content in both methods' tables
+        if len(methods) == 2:
+            mismatches = []
+            for s in streams:
+                a = fingerprint(client, leg_cfgs[methods[0]], s)
+                b = fingerprint(client, leg_cfgs[methods[1]], s)
+                if a != b:
+                    mismatches.append(f"{s}: {methods[0]}={a} {methods[1]}={b}")
+            match = "MISMATCH" if mismatches else "✓ identical"
+            for r in results:
+                if r["scenario"] == name:
+                    r["match"] = match
+                    if mismatches and "FAIL" not in r["result"]:
+                        r["result"] = "FAIL (content mismatch)"
+            for m in mismatches:
+                print(f"    !! {m}")
+            print(f"=== {name}: cross-method content check: {match}")
 
 
 if __name__ == "__main__":
