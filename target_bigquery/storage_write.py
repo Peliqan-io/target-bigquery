@@ -12,6 +12,7 @@
 Throughput test: 11m 0s @ 1M rows / 150 keys / 1.5GB
 NOTE: This is naive and will vary drastically based on network speed, for example on a GCP VM.
 """
+import concurrent.futures
 import os
 from io import BytesIO
 from time import sleep
@@ -61,6 +62,24 @@ logger = logging.getLogger(__name__)
 # Stream specific constant
 MAX_IN_FLIGHT = 15
 """Maximum number of concurrent requests per worker be processed by grpc before awaiting."""
+
+APPEND_RESULT_TIMEOUT = 120.0
+"""Deadline (seconds) for an in-flight AppendRows request to resolve.
+
+Once a stream is open there is otherwise NO deadline on appends: the bidi
+stream can go half-dead (gRPC call wedged but still reported active) and
+`future.result()` then blocks forever — observed as a 1M-row sync frozen at
+~240k rows for 50+ minutes with a library thread spinning at 100% CPU. On this
+timeout the stream is declared dead, closed, and the request re-sent on a
+fresh channel."""
+
+MAX_APPEND_ATTEMPTS = 3
+"""Send attempts per AppendRows request before its failure is reported.
+
+Append failures arrive asynchronously on the response future, so the job-level
+retry in run() (which only catches synchronous send() errors) never sees them.
+Observed in the wild: one transient 400 row_errors response at ~900k rows
+killed a 1M-row sync whose identical rerun passed."""
 
 MAX_REQUEST_BYTES = 19_500_000
 """Byte budget for a single AppendRows request payload.
@@ -324,7 +343,11 @@ class StorageWriteBatchWorker(BaseWorker):
                 for idx, chunk in enumerate(chunks, 1):
                     if not write_stream.endswith("_default"):
                         kwargs["offset"] = self.offsets[job.parent]
-                    self.awaiting.append(dispatch(generate_request(chunk, **kwargs)))
+                    # The request and its job travel with the future so wait()
+                    # can re-send on a fresh stream after a timeout or error
+                    # (memory: up to ~MAX_IN_FLIGHT retained requests).
+                    request = generate_request(chunk, **kwargs)
+                    self.awaiting.append((dispatch(request), job, request, 1))
                     nrows = len(chunk.serialized_rows)
                     chunk_bytes = sum(len(r) for r in chunk.serialized_rows)
                     self.logger.info(
@@ -374,15 +397,63 @@ class StorageWriteBatchWorker(BaseWorker):
             except Exception as exc:
                 self.error_notifier.send((exc, self.serialize_exception(exc)))
 
+    def _ensure_stream(self, job: Job) -> Dispatcher:
+        """Return a usable dispatcher for job.parent, opening a fresh
+        channel + stream if the cached one is closed (mirrors run()'s
+        reopen path)."""
+        entry = self.cache.get(job.parent)
+        if entry is None or entry[1]._closed:
+            client: BigQueryWriteClient = storage_client_factory(self.credentials)
+            entry = self.cache[job.parent] = self.get_stream_components(client, job)
+        return cast(StreamComponents, entry)[2]
+
     def wait(self, drain: bool = False) -> None:
-        """Wait for in-flight requests to complete."""
+        """Wait for in-flight requests, bounded by APPEND_RESULT_TIMEOUT.
+
+        A request that times out or fails is re-sent up to
+        MAX_APPEND_ATTEMPTS times; on a timeout the stream is first declared
+        dead and closed so the resend (and every later job) gets a fresh
+        channel. Only _default streams are re-sent — they are at-least-once by
+        contract, and their stream path is identical after a reopen.
+        Application streams carry offsets and finalize/commit semantics where
+        a blind resend would corrupt the stream, so those still fail fast."""
         while self.awaiting and ((len(self.awaiting) > MAX_IN_FLIGHT // 2) or drain):
+            future, job, request, attempts = self.awaiting.pop(0)
             try:
-                self.awaiting.pop(0).result()
+                future.result(timeout=APPEND_RESULT_TIMEOUT)
             except Exception as exc:
+                retriable = (attempts < MAX_APPEND_ATTEMPTS
+                             and job.template.write_stream.endswith("_default"))
+                if retriable:
+                    if isinstance(exc, concurrent.futures.TimeoutError):
+                        # No response within the deadline — the bidi stream is
+                        # wedged. Close it: this fails its other pending
+                        # futures (they retry through this same path) and
+                        # makes _ensure_stream open a fresh channel.
+                        stale = self.cache.get(job.parent)
+                        if stale is not None:
+                            try:
+                                stale[1].close()
+                            except Exception:
+                                pass
+                    self.logger.warning(
+                        f"[{self.ext_id}] AppendRows request to {job.parent} failed"
+                        f" (attempt {attempts}/{MAX_APPEND_ATTEMPTS}): {exc!r}"
+                        f" — re-sending."
+                    )
+                    try:
+                        dispatch = self._ensure_stream(job)
+                        self.awaiting.append(
+                            (dispatch(request), job, request, attempts + 1)
+                        )
+                        continue  # notifier fires when finally resolved
+                    except Exception as reopen_exc:
+                        self.logger.error(
+                            f"[{self.ext_id}] Stream reopen for {job.parent} failed"
+                            f" ({reopen_exc!r}); reporting the original error."
+                        )
                 self.error_notifier.send((exc, self.serialize_exception(exc)))
-            finally:
-                self.job_notifier.send(True)
+            self.job_notifier.send(True)
 
 
 class StorageWriteStreamWorker(StorageWriteBatchWorker):
