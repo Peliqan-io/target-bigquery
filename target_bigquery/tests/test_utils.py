@@ -4,6 +4,8 @@ import pytest
 import singer_sdk.typing as th
 from google.cloud.bigquery import SchemaField
 
+from unittest.mock import MagicMock, patch
+
 from target_bigquery.core import SchemaTranslator, bigquery_type, transform_column_name, BigQueryTable, IngestionStrategy
 from target_bigquery.proto_gen import proto_schema_factory_v2
 
@@ -701,3 +703,194 @@ def test_jit_compile_proto():
         == b"\x08\x01\x12\x04test\x19\x00\x00\x00\x00\x00\x00\xf0?"
         b" \x01*\n2020-01-012\n2020-01-01:\x0800:00:00"
     )
+
+
+# --------------------------------------------------------------------------- #
+# delete-sync (DELETERECORD)                                                    #
+# --------------------------------------------------------------------------- #
+
+
+def _bare_target(config=None, buffer=None):
+    """A TargetBigQuery without __init__ (no worker pool / no BQ client)."""
+    from target_bigquery.target import TargetBigQuery
+
+    t = TargetBigQuery.__new__(TargetBigQuery)
+    t._delete_buffer = {} if buffer is None else buffer
+    t._config = config or {"project": "p", "dataset": "d"}
+    t._credentials = MagicMock()
+    return t
+
+
+def test_process_unknown_message_buffers_deleterecord():
+    t = _bare_target()
+    t._process_unknown_message(
+        {"type": "DELETERECORD", "stream": "Accounts", "record": {"id": "a1"}}
+    )
+    t._process_unknown_message(
+        {"type": "DELETERECORD", "stream": "Accounts", "record": {"id": "a2"}}
+    )
+    t._process_unknown_message(
+        {"type": "DELETERECORD", "stream": "Contacts", "record": {"id": "c1"}}
+    )
+    assert t._delete_buffer == {
+        "Accounts": [{"id": "a1"}, {"id": "a2"}],
+        "Contacts": [{"id": "c1"}],
+    }
+
+
+def test_process_unknown_message_raises_for_other_types():
+    t = _bare_target()
+    with pytest.raises(ValueError):
+        t._process_unknown_message({"type": "SOMETHING_ELSE"})
+    assert t._delete_buffer == {}
+
+
+def _run_flush(buffer, denormalized=False, extra_config=None, query_side_effect=None):
+    config = {"project": "p", "dataset": "d", "denormalized": denormalized}
+    if extra_config:
+        config.update(extra_config)
+    t = _bare_target(config=config, buffer=buffer)
+    client = MagicMock()
+    if query_side_effect is not None:
+        client.query.side_effect = query_side_effect
+    with patch("target_bigquery.target.bigquery_client_factory", return_value=client):
+        t._flush_deletes()
+    return t, client
+
+
+def _sql(client):
+    return client.query.call_args.args[0]
+
+
+def _vals(client):
+    return client.query.call_args.kwargs["job_config"].query_parameters[0].values
+
+
+def test_flush_fixed_single_pk():
+    t, client = _run_flush({"Accounts": [{"id": "a1"}, {"id": "a2"}]}, denormalized=False)
+    assert client.query.call_count == 1
+    assert _sql(client) == (
+        "DELETE FROM `p`.`d`.`accounts` "
+        "WHERE JSON_VALUE(data, '$.id') IN UNNEST(@vals)"
+    )
+    assert _vals(client) == ["a1", "a2"]
+    assert t._delete_buffer == {}
+
+
+def test_flush_fixed_composite_pk():
+    _, client = _run_flush({"Journals": [{"id": "g1", "division": 100}]}, denormalized=False)
+    assert _sql(client) == (
+        "DELETE FROM `p`.`d`.`journals` WHERE "
+        "CONCAT(JSON_VALUE(data, '$.id'), '\\u001f', JSON_VALUE(data, '$.division')) "
+        "IN UNNEST(@vals)"
+    )
+    assert _vals(client) == ["g1\u001f100"]
+
+
+def test_flush_denormalized_single_pk():
+    _, client = _run_flush({"Accounts": [{"id": "a1"}]}, denormalized=True)
+    assert _sql(client) == (
+        "DELETE FROM `p`.`d`.`accounts` WHERE CAST(`id` AS STRING) IN UNNEST(@vals)"
+    )
+    assert _vals(client) == ["a1"]
+
+
+def test_flush_denormalized_composite_pk():
+    _, client = _run_flush({"Inv": [{"a": 1, "b": 2}]}, denormalized=True)
+    assert _sql(client) == (
+        "DELETE FROM `p`.`d`.`inv` WHERE "
+        "CONCAT(CAST(`a` AS STRING), '\\u001f', CAST(`b` AS STRING)) IN UNNEST(@vals)"
+    )
+    assert _vals(client) == ["1\u001f2"]
+
+
+def test_flush_denormalized_applies_column_transform():
+    # baserow runs BigQuery denormalized with add_underscore_when_invalid, so a
+    # digit-leading key is stored as a `_`-prefixed column; the delete must match.
+    _, client = _run_flush(
+        {"Accounts": [{"123id": "a1"}]},
+        denormalized=True,
+        extra_config={"column_name_transforms": {"add_underscore_when_invalid": True}},
+    )
+    assert _sql(client) == (
+        "DELETE FROM `p`.`d`.`accounts` WHERE CAST(`_123id` AS STRING) IN UNNEST(@vals)"
+    )
+    assert _vals(client) == ["a1"]
+
+
+def test_flush_chunks_by_batch_size():
+    records = [{"id": f"a{i}"} for i in range(5)]
+    _, client = _run_flush({"Accounts": records}, extra_config={"batch_size": 2})
+    assert client.query.call_count == 3  # 2 + 2 + 1
+    chunks = [
+        c.kwargs["job_config"].query_parameters[0].values
+        for c in client.query.call_args_list
+    ]
+    assert chunks == [["a0", "a1"], ["a2", "a3"], ["a4"]]
+
+
+def test_flush_skips_missing_table_and_continues():
+    # NotFound (table/dataset absent) is a best-effort skip; other streams still run.
+    from google.api_core.exceptions import NotFound
+
+    t = _bare_target(buffer={"Gone": [{"id": "x"}], "Accounts": [{"id": "a1"}]})
+    client = MagicMock()
+    client.query.side_effect = [NotFound("missing"), MagicMock()]
+    with patch("target_bigquery.target.bigquery_client_factory", return_value=client):
+        t._flush_deletes()  # must not raise
+    assert client.query.call_count == 2  # second stream still attempted
+    assert t._delete_buffer == {}  # cleared after a clean pass
+
+
+def test_flush_raises_on_real_error_and_keeps_buffer():
+    # A real failure (connection/credential/etc.) must propagate so state never
+    # advances, and the buffer is NOT cleared.
+    t = _bare_target(buffer={"Accounts": [{"id": "a1"}]})
+    client = MagicMock()
+    client.query.side_effect = Exception("connection reset")
+    with patch("target_bigquery.target.bigquery_client_factory", return_value=client):
+        with pytest.raises(Exception):
+            t._flush_deletes()
+    assert t._delete_buffer == {"Accounts": [{"id": "a1"}]}
+
+
+def test_drain_all_does_not_write_state_when_delete_fails():
+    # The bookmark must not advance past a delete that failed: a raising flush
+    # aborts drain_all before _write_state_message.
+    t = _bare_target(buffer={"Accounts": [{"id": "a1"}]})
+    t._latest_state = {"bookmarks": {"x": 1}}
+    t._sinks_active = {}
+    t.workers = []
+    t.max_parallelism = 1
+    t._drain_all = MagicMock()
+    t._write_state_message = MagicMock()
+    t._reset_max_record_age = MagicMock()
+    client = MagicMock()
+    client.query.side_effect = Exception("creds error")
+    with patch("target_bigquery.target.bigquery_client_factory", return_value=client):
+        with pytest.raises(Exception):
+            t.drain_all(is_endofpipe=True)
+    t._write_state_message.assert_not_called()
+
+
+def test_flush_one_query_per_stream():
+    _, client = _run_flush(
+        {"Accounts": [{"id": "a1"}], "Contacts": [{"id": "c1"}]}
+    )
+    assert client.query.call_count == 2
+    sqls = " ".join(c.args[0] for c in client.query.call_args_list)
+    assert "`p`.`d`.`accounts`" in sqls
+    assert "`p`.`d`.`contacts`" in sqls
+
+
+def test_flush_applies_prefix_and_sanitizes_table_name():
+    _, client = _run_flush(
+        {"My-Stream.X": [{"id": "a1"}]}, extra_config={"table_name_prefix": "px_"}
+    )
+    assert _sql(client).startswith("DELETE FROM `p`.`d`.`px_my_stream_x`")
+
+
+def test_flush_skips_empty_record_lists():
+    t, client = _run_flush({"Accounts": []})
+    client.query.assert_not_called()
+    assert t._delete_buffer == {}
