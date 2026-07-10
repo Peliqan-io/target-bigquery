@@ -20,7 +20,17 @@ from singer_sdk import typing as th
 from singer_sdk.target_base import Target
 
 from target_bigquery.batch_job import BigQueryBatchJobDenormalizedSink, BigQueryBatchJobSink
-from target_bigquery.core import BaseBigQuerySink, BaseWorker, BigQueryCredentials, ParType
+from google.api_core.exceptions import NotFound
+from google.cloud import bigquery
+
+from target_bigquery.core import (
+    BaseBigQuerySink,
+    BaseWorker,
+    BigQueryCredentials,
+    ParType,
+    bigquery_client_factory,
+    transform_column_name,
+)
 from target_bigquery.gcs_stage import BigQueryGcsStagingDenormalizedSink, BigQueryGcsStagingSink
 from target_bigquery.storage_write import (
     BigQueryStorageWriteDenormalizedSink,
@@ -325,6 +335,10 @@ class TargetBigQuery(Target):
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
         self.max_parallelism = 1
+        # Buffer for DELETERECORD Singer messages keyed by stream name.
+        # Populated in _process_unknown_message; flushed once at end-of-pipe
+        # after all sink.clean_up() calls so upserts always land before deletes.
+        self._delete_buffer: dict = {}
         (
             self.proc_cls,
             self.pipe_cls,
@@ -492,6 +506,28 @@ class TargetBigQuery(Target):
             return self.add_sink(stream_name, schema, key_properties)
         return existing_sink
 
+    # ------------------------------------------------------------------ #
+    # delete-sync support                                                  #
+    # ------------------------------------------------------------------ #
+
+    supports_delete_sync: bool = True
+    """Advertises delete-sync capability to baserow's target-support gate."""
+
+    def _process_unknown_message(self, message_dict: dict) -> None:
+        """Intercept DELETERECORD messages; delegate everything else to the SDK.
+
+        DELETERECORD is a Peliqan Singer extension not in the SDK's
+        SingerMessageType enum, so the SDK routes it here.  We buffer the
+        record keyed by stream; _flush_deletes() drains the buffer at
+        end-of-pipe, after all sink.clean_up() upserts have completed.
+        """
+        if message_dict.get("type") == "DELETERECORD":
+            stream = message_dict.get("stream", "")
+            record = message_dict.get("record", {})
+            self._delete_buffer.setdefault(stream, []).append(record)
+            return
+        super()._process_unknown_message(message_dict)
+
     def drain_one(self, sink: Sink) -> None:  # type: ignore
         """Drain a sink. Includes a hook to manage the worker pool and notifications."""
         #self.logger.info(f"Jobs queued : {self.queue.qsize()} | Max nb jobs queued : {os.cpu_count() * 4} | Nb workers : {len(self.workers)} | Max nb workers : {os.cpu_count() * 2}")
@@ -542,6 +578,13 @@ class TargetBigQuery(Target):
             self._raise_pending_worker_error()
             for sink in self._sinks_active.values():
                 sink.pre_state_hook()
+        # Apply buffered DELETERECORDs *before* advancing state, so the bookmark
+        # never moves past deletes that were not applied. At end-of-pipe this runs
+        # after the clean_up() upserts above (an upsert + delete of the same key in
+        # one run ends deleted). A real delete failure raises here, so the state
+        # write below is skipped and the tap replays the deletes on the next run.
+        if self._delete_buffer:
+            self._flush_deletes()
         if state:
             self._write_state_message(state)
         self._reset_max_record_age()
@@ -558,3 +601,78 @@ class TargetBigQuery(Target):
             e, msg = self.error_notification.recv()
             self.logger.error(msg)
             raise RuntimeError(msg) from e
+    def _flush_deletes(self) -> None:
+        """Apply buffered DELETERECORDs as one batched, parameterized DELETE per
+        table. Storage-mode-aware (FIXED -> JSON_VALUE(data,...), DENORMALIZED ->
+        real columns).
+
+        Error policy mirrors target-postgres: a delete that cannot be *applied* is
+        a best-effort skip -- a key matching no rows is not an error in BigQuery
+        (0 rows affected, no exception), and a missing table/dataset (NotFound,
+        e.g. a stream never synced) is logged and skipped. Any other failure
+        (connection, credentials, permission, quota, bad SQL) is raised so the
+        caller does not advance the bookmark past deletes that never landed."""
+        client = bigquery_client_factory(self._credentials)
+        denormalized = self.config.get("denormalized", False)
+        project, dataset = self.config["project"], self.config["dataset"]
+        prefix = self.config.get("table_name_prefix", "")
+        transforms = self.config.get("column_name_transforms", {})
+
+        def accessor(col: str) -> str:
+            # Compare as text: JSON_VALUE returns STRING; CAST aligns typed columns
+            # with the str()-rendered parameter values.
+            if denormalized:
+                # Denormalized writes store columns under the transformed name
+                # (core.SchemaTranslator.translate_record); apply the same
+                # transform so the delete predicate targets the real column.
+                physical = transform_column_name(col, **{**transforms, "quote": False})
+                return f"CAST(`{physical}` AS STRING)"
+            return f"JSON_VALUE(data, '$.{col}')"
+
+        # Reuse the write-path batch size (baserow -> 5000, default fallback
+        # 10_000). The values ride in a query parameter so query length is not the
+        # limit, but chunking keeps each request well under BigQuery's 10 MB cap
+        # and emits one DELETE per chunk (DML-quota friendly).
+        batch_size = self.config.get("batch_size", 10_000)
+
+        for stream, records in self._delete_buffer.items():
+            if not records:
+                continue
+            name = prefix + stream.lower().replace("-", "_").replace(".", "_")
+            escaped = f"`{project}`.`{dataset}`.`{name}`"
+            cols = list(records[0].keys())  # stable column order across the batch
+
+            if len(cols) == 1:
+                key_expr = accessor(cols[0])
+                vals = [str(r[cols[0]]) for r in records]
+            else:
+                # Composite key: join per-column text with the unit-separator
+                # control char (assumed absent from GUID/int/text key values).
+                key_expr = "CONCAT(" + ", '\\u001f', ".join(accessor(c) for c in cols) + ")"
+                vals = ["\u001f".join(str(r[c]) for c in cols) for r in records]
+
+            sql = f"DELETE FROM {escaped} WHERE {key_expr} IN UNNEST(@vals)"
+            try:
+                for start in range(0, len(vals), batch_size):
+                    chunk = vals[start:start + batch_size]
+                    job_config = bigquery.QueryJobConfig(
+                        query_parameters=[
+                            bigquery.ArrayQueryParameter("vals", "STRING", chunk)
+                        ]
+                    )
+                    client.query(sql, job_config=job_config).result()
+                self.logger.info(
+                    "delete-sync: removed up to %d row(s) from %s", len(vals), name
+                )
+            except NotFound:
+                # Table/dataset absent (e.g. a stream that was never synced). The
+                # delete cannot apply; skip best-effort and continue other streams.
+                self.logger.warning(
+                    "delete-sync: table %s not found; skipping its deletes", name
+                )
+                continue
+            # Any other exception (connection, credentials, permission, quota, bad
+            # SQL) propagates: drain_all aborts before writing state, so the
+            # bookmark is not advanced and the tap replays these deletes next run.
+
+        self._delete_buffer.clear()
