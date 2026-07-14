@@ -287,6 +287,11 @@ class Job():
     # batches used to send one ping per chunk, driving the target's
     # _jobs_enqueued counter negative).
     chunks_pending: int = 0
+    # chunks already successfully dispatched (across attempts): a requeued job
+    # resumes at chunks[dispatched] instead of re-sending chunks whose original
+    # futures may still succeed — re-sending them duplicates rows (default
+    # stream) or appends at new offsets (application streams).
+    dispatched: int = 0
     
     def __init__(self,
         parent,
@@ -326,19 +331,24 @@ class StorageWriteBatchWorker(BaseWorker):
                 break
             if job is None:
                 break
-            if job.parent not in self.cache or self.cache[job.parent][1]._closed:
-                # Each AppendRowsStream gets its own client, i.e. its own gRPC
-                # channel. Opening a second bidi stream on a channel that already
-                # carried one intermittently stalls inside _open() (the issue #71
-                # hang with nested RECORD schemas); a fresh channel opens reliably.
-                # Stream opens are rare (once per table per worker + recycles), so
-                # the extra client is cheap.
-                client: BigQueryWriteClient = fresh_storage_client(self.credentials)
-                self.cache[job.parent] = self.get_stream_components(client, job)
-                self.offsets[job.parent] = 0
-            write_stream, _, dispatch = cast(StreamComponents, self.cache[job.parent])
-
             try:
+                # Stream/client setup lives INSIDE the protected block: in
+                # application-stream mode get_stream_components makes a network
+                # call (create_write_stream), and a transient failure there used
+                # to escape run() entirely — dead worker, job neither requeued
+                # nor reported, state written over the dropped batch.
+                if job.parent not in self.cache or self.cache[job.parent][1]._closed:
+                    # Each AppendRowsStream gets its own client, i.e. its own gRPC
+                    # channel. Opening a second bidi stream on a channel that already
+                    # carried one intermittently stalls inside _open() (the issue #71
+                    # hang with nested RECORD schemas); a fresh channel opens reliably.
+                    # Stream opens are rare (once per table per worker + recycles), so
+                    # the extra client is cheap.
+                    client: BigQueryWriteClient = fresh_storage_client(self.credentials)
+                    self.cache[job.parent] = self.get_stream_components(client, job)
+                    self.offsets[job.parent] = 0
+                write_stream, _, dispatch = cast(StreamComponents, self.cache[job.parent])
+
                 kwargs = {"offset": None, "path": None}
                 if write_stream.endswith("_default"):
                     kwargs["path"] = write_stream
@@ -349,19 +359,26 @@ class StorageWriteBatchWorker(BaseWorker):
                 # logger (not log_notifier): notifier messages are only drained during
                 # drain_one, so end-of-pipe activity would be invisible in the logs.
                 chunks = list(chunk_proto_rows(job.data, self.max_request_bytes))
-                job.chunks_pending = len(chunks)
-                if not chunks:
-                    # empty batch: nothing to await — balance the enqueue count
-                    self.job_notifier.send(True)
-                if len(chunks) > 1:
-                    total_bytes = sum(len(r) for r in job.data.serialized_rows)
-                    self.logger.info(
-                        f"[{self.ext_id}] Batch of {len(job.data.serialized_rows)} rows"
-                        f" ({total_bytes:,} bytes) for {job.parent} exceeds"
-                        f" max_request_bytes={self.max_request_bytes:,};"
-                        f" splitting into {len(chunks)} AppendRows requests."
-                    )
-                for idx, chunk in enumerate(chunks, 1):
+                if job.dispatched == 0:
+                    # first attempt only: on a retry the original futures of the
+                    # already-dispatched chunks still decrement this counter, so
+                    # resetting it would corrupt the completion accounting.
+                    job.chunks_pending = len(chunks)
+                    if not chunks:
+                        # empty batch: nothing to await — balance the enqueue count
+                        self.job_notifier.send(True)
+                    if len(chunks) > 1:
+                        total_bytes = sum(len(r) for r in job.data.serialized_rows)
+                        self.logger.info(
+                            f"[{self.ext_id}] Batch of {len(job.data.serialized_rows)} rows"
+                            f" ({total_bytes:,} bytes) for {job.parent} exceeds"
+                            f" max_request_bytes={self.max_request_bytes:,};"
+                            f" splitting into {len(chunks)} AppendRows requests."
+                        )
+                # resume after the last successfully dispatched chunk: chunking
+                # is deterministic (same data, same limit), so indices are stable
+                # across attempts and in-flight chunks are never re-sent.
+                for idx, chunk in enumerate(chunks[job.dispatched:], job.dispatched + 1):
                     if not write_stream.endswith("_default"):
                         kwargs["offset"] = self.offsets[job.parent]
                     # The request and its job travel with the future so wait()
@@ -369,6 +386,7 @@ class StorageWriteBatchWorker(BaseWorker):
                     # (memory: up to ~MAX_IN_FLIGHT retained requests).
                     request = generate_request(chunk, **kwargs)
                     self.awaiting.append((dispatch(request), job, request, 1))
+                    job.dispatched += 1
                     nrows = len(chunk.serialized_rows)
                     chunk_bytes = sum(len(r) for r in chunk.serialized_rows)
                     self.logger.info(
@@ -594,9 +612,14 @@ class BigQueryStorageWriteSink(BaseBigQuerySink):
 
     @property
     def fallback_job_config(self) -> Dict[str, Any]:
-        """LoadJobConfig kwargs for the oversized-record fallback (mirrors batch_job)."""
+        """LoadJobConfig kwargs for the oversized-record fallback (mirrors batch_job).
+
+        The schema must be resolved WITH column-name transforms: the buffered
+        NDJSON rows carry transformed keys (they went through preprocess_record),
+        so an untransformed schema would silently drop those columns under
+        ignore_unknown_values."""
         return {
-            "schema": self.table.get_resolved_schema(),
+            "schema": self.table.get_resolved_schema(self.apply_transforms),
             "source_format": bigquery.SourceFormat.NEWLINE_DELIMITED_JSON,
             "write_disposition": bigquery.WriteDisposition.WRITE_APPEND,
         }
@@ -772,9 +795,11 @@ class BigQueryStorageWriteDenormalizedSink(Denormalized, BigQueryStorageWriteSin
     @property
     def fallback_job_config(self) -> Dict[str, Any]:
         # Mirrors BigQueryBatchJobDenormalizedSink.job_config so fallback rows get
-        # the same load semantics as the batch_job path.
+        # the same load semantics as the batch_job path. Schema is resolved WITH
+        # column transforms — the buffered rows carry transformed keys, and with
+        # ignore_unknown_values an untransformed schema silently drops them.
         return {
-            "schema": self.table.get_resolved_schema(),
+            "schema": self.table.get_resolved_schema(self.apply_transforms),
             "source_format": bigquery.SourceFormat.NEWLINE_DELIMITED_JSON,
             "write_disposition": bigquery.WriteDisposition.WRITE_APPEND,
             "schema_update_options": [
