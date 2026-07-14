@@ -138,6 +138,18 @@ schemas (issue #71). A healthy open takes well under a second, so 90s is generou
 past that we fail loudly and let the worker recycle the stream on a fresh channel."""
 
 
+def fresh_storage_client(credentials) -> BigQueryWriteClient:
+    """A NEW BigQueryWriteClient with its OWN gRPC channel.
+
+    core.py's storage_client_factory is @cache'd, so calling it returns the
+    same client (same channel) for the process lifetime — silently defeating
+    the fresh-channel-per-stream-open fix and making timeout recycles reopen
+    on the very channel that just wedged. Bypass the cache (reviewer finding,
+    2026-07-09). Opens are rare (once per table per worker + recycles), so an
+    uncached client here is cheap."""
+    return storage_client_factory.__wrapped__(credentials)
+
+
 class BoundedOpenAppendRowsStream(writer.AppendRowsStream):
     """AppendRowsStream whose open wait is bounded by STREAM_OPEN_TIMEOUT."""
 
@@ -270,6 +282,11 @@ class Job():
     stream_notifier: Connection
     data: types.ProtoRows
     attempts: int = 1
+    # chunks still awaiting a response; the job-completion ping fires when the
+    # LAST chunk resolves so one enqueued job == exactly one ping (split
+    # batches used to send one ping per chunk, driving the target's
+    # _jobs_enqueued counter negative).
+    chunks_pending: int = 0
     
     def __init__(self,
         parent,
@@ -316,7 +333,7 @@ class StorageWriteBatchWorker(BaseWorker):
                 # hang with nested RECORD schemas); a fresh channel opens reliably.
                 # Stream opens are rare (once per table per worker + recycles), so
                 # the extra client is cheap.
-                client: BigQueryWriteClient = storage_client_factory(self.credentials)
+                client: BigQueryWriteClient = fresh_storage_client(self.credentials)
                 self.cache[job.parent] = self.get_stream_components(client, job)
                 self.offsets[job.parent] = 0
             write_stream, _, dispatch = cast(StreamComponents, self.cache[job.parent])
@@ -332,6 +349,10 @@ class StorageWriteBatchWorker(BaseWorker):
                 # logger (not log_notifier): notifier messages are only drained during
                 # drain_one, so end-of-pipe activity would be invisible in the logs.
                 chunks = list(chunk_proto_rows(job.data, self.max_request_bytes))
+                job.chunks_pending = len(chunks)
+                if not chunks:
+                    # empty batch: nothing to await — balance the enqueue count
+                    self.job_notifier.send(True)
                 if len(chunks) > 1:
                     total_bytes = sum(len(r) for r in job.data.serialized_rows)
                     self.logger.info(
@@ -360,8 +381,11 @@ class StorageWriteBatchWorker(BaseWorker):
                         self.wait()
             except RecordTooLargeError as exc:
                 # Deterministic failure — retrying cannot help, report immediately.
+                # Raised while materializing chunks, so nothing was dispatched;
+                # the job is terminally consumed — balance the enqueue count.
                 self.logger.error(f"[{self.ext_id}] {exc}")
                 self.error_notifier.send((exc, self.serialize_exception(exc)))
+                self.job_notifier.send(True)
             except Exception as exc:
                 job.attempts += 1
                 self.logger.info(f"job.attempts : {job.attempts}")
@@ -403,7 +427,7 @@ class StorageWriteBatchWorker(BaseWorker):
         reopen path)."""
         entry = self.cache.get(job.parent)
         if entry is None or entry[1]._closed:
-            client: BigQueryWriteClient = storage_client_factory(self.credentials)
+            client: BigQueryWriteClient = fresh_storage_client(self.credentials)
             entry = self.cache[job.parent] = self.get_stream_components(client, job)
         return cast(StreamComponents, entry)[2]
 
@@ -453,7 +477,12 @@ class StorageWriteBatchWorker(BaseWorker):
                             f" ({reopen_exc!r}); reporting the original error."
                         )
                 self.error_notifier.send((exc, self.serialize_exception(exc)))
-            self.job_notifier.send(True)
+            # one enqueued job == exactly one completion ping: fire only when
+            # the job's LAST outstanding chunk resolves (success or final
+            # failure). Resent chunks skip this via the `continue` above.
+            job.chunks_pending -= 1
+            if job.chunks_pending == 0:
+                self.job_notifier.send(True)
 
 
 class StorageWriteStreamWorker(StorageWriteBatchWorker):
