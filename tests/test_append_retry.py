@@ -59,8 +59,12 @@ class FakeDispatch:
 
 
 def make_job(stream_path=DEFAULT_PATH):
+    # chunks_pending mirrors the real Job: run() sets it to the number of
+    # dispatched chunks before wait() ever sees the job; these tests dispatch
+    # one request per job.
     return SimpleNamespace(parent=PARENT,
-                           template=SimpleNamespace(write_stream=stream_path))
+                           template=SimpleNamespace(write_stream=stream_path),
+                           chunks_pending=1)
 
 
 def make_worker(first_future, job, dispatch, stream=None):
@@ -103,7 +107,7 @@ def test_timeout_closes_stream_and_resends_on_fresh_one(monkeypatch):
         FakeFuture(concurrent.futures.TimeoutError("no response")),
         make_job(), old_dispatch, old_stream,
     )
-    monkeypatch.setattr(sw, "storage_client_factory", lambda creds: "client")
+    monkeypatch.setattr(sw, "fresh_storage_client", lambda creds: "client")
     worker.credentials = None
     worker.get_stream_components = (
         lambda client, job: ("new-path", FakeStream(), new_dispatch)
@@ -142,7 +146,7 @@ def test_application_stream_fails_fast_no_resend():
 def test_reopen_failure_reports_original_error(monkeypatch):
     boom = concurrent.futures.TimeoutError("no response")
     worker = make_worker(FakeFuture(boom), make_job(), FakeDispatch([]))
-    monkeypatch.setattr(sw, "storage_client_factory", lambda creds: "client")
+    monkeypatch.setattr(sw, "fresh_storage_client", lambda creds: "client")
     worker.credentials = None
 
     def broken_reopen(client, job):
