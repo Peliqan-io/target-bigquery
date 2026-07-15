@@ -1,0 +1,4 @@
+{"type": "SCHEMA", "stream": "json_cols", "schema": {"type": "object", "properties": {"id": {"type": ["integer", "null"]}, "metadata": {"type": ["object", "null"]}, "events": {"type": ["array", "null"], "items": {"type": "object"}}, "attributes": {"type": ["object", "null"]}}}, "key_properties": ["id"]}
+{"type": "RECORD", "stream": "json_cols", "record": {"id": 1, "metadata": {"foo": "bar", "nested": {"n": 5}}, "events": [{"kind": "created"}, {"kind": "paid", "by": "sys"}], "attributes": {"a": 1, "b": [true, false]}}}
+{"type": "RECORD", "stream": "json_cols", "record": {"id": 2, "metadata": {"only": "this"}, "events": [], "attributes": {}}}
+{"type": "STATE", "value": {"bookmarks": {"json_cols": {"replication_key_value": 2}}}}

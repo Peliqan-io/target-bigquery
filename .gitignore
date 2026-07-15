@@ -142,3 +142,5 @@ plugins/
 
 # IDE
 .idea/
+# Local benchmark fixtures (contain real configs/credentials and large generated data)
+tests/local_fixtures/

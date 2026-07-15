@@ -76,7 +76,14 @@ def proto_schema_factory_v2(
     factory = message_factory.MessageFactory(pool=pool)
     try:
         proto_descriptor = factory.pool.FindMessageTypeByName(clsname)
-        proto_cls = factory.GetPrototype(proto_descriptor)
+        # factory.GetPrototype(proto_descriptor) raised on every sink init:
+        #   UserWarning: MessageFactory class is deprecated. Please use
+        #   GetMessageClass() instead of MessageFactory.GetPrototype.
+        #   MessageFactory class will be removed after 2024.
+        # GetPrototype is removed in protobuf 5.26+, so with our pin
+        # (protobuf >=4.25.8,<5) this swap keeps sink init from breaking
+        # on the eventual 5.x upgrade.
+        proto_cls = message_factory.GetMessageClass(proto_descriptor)
     except KeyError:
         package, name = clsname.rsplit(".", 1)
         file_proto = descriptor_pb2.FileDescriptorProto()
@@ -90,7 +97,7 @@ def proto_schema_factory_v2(
                 setattr(field_proto, k, v)
         factory.pool.Add(file_proto)
         proto_descriptor = factory.pool.FindMessageTypeByName(clsname)
-        proto_cls = factory.GetPrototype(proto_descriptor)
+        proto_cls = message_factory.GetMessageClass(proto_descriptor)
     return proto_cls
 
 

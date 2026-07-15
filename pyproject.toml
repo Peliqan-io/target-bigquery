@@ -36,6 +36,10 @@ google-cloud-bigquery = { version = ">=3.4.1,<4", extras = ["bqstorage"] }
 google-api-core = "<=2.27.0"
 orjson = ">=3.7.2,<4"
 tenacity = ">=8.0.1,<9"
+# 4.25.8 floor: protobuf 4.23.x upb backend segfaults when the main thread
+# ParseDicts nested messages while worker/bidi threads serialize concurrently
+# (storage_write nested RECORD volume loads; see issue #71 investigation).
+protobuf = ">=4.25.8,<5"
 grpcio-tools = ">=1.51.1,<2"
 google-cloud-storage = ">=2.7.0,<3"
 grpcio-status = ">=1.51.1,<2"
