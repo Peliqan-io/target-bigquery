@@ -38,6 +38,7 @@ from typing import (
 import orjson, decimal
 from google.cloud import bigquery
 from google.cloud.bigquery_storage_v1 import BigQueryWriteClient, types, writer
+from google.cloud.bigquery_storage_v1 import exceptions as bqstorage_exceptions
 from google.protobuf import json_format
 from proto import Message
 from tenacity import retry, stop_after_attempt, wait_fixed
@@ -332,6 +333,32 @@ class StorageWriteBatchWorker(BaseWorker):
             if job is None:
                 break
             try:
+                # Chunk BEFORE any stream work: an empty job (its rows all took
+                # the Load Job fallback) must never open an AppendRows stream —
+                # a stream that never sends raises StreamClosedError on close
+                # with bigquery-storage >= 2.3x (PR #9 report, 2026-07-15).
+                # logger (not log_notifier): notifier messages are only drained during
+                # drain_one, so end-of-pipe activity would be invisible in the logs.
+                chunks = list(chunk_proto_rows(job.data, self.max_request_bytes))
+                if job.dispatched == 0:
+                    # first attempt only: on a retry the original futures of the
+                    # already-dispatched chunks still decrement this counter, so
+                    # resetting it would corrupt the completion accounting.
+                    job.chunks_pending = len(chunks)
+                    if len(chunks) > 1:
+                        total_bytes = sum(len(r) for r in job.data.serialized_rows)
+                        self.logger.info(
+                            f"[{self.ext_id}] Batch of {len(job.data.serialized_rows)} rows"
+                            f" ({total_bytes:,} bytes) for {job.parent} exceeds"
+                            f" max_request_bytes={self.max_request_bytes:,};"
+                            f" splitting into {len(chunks)} AppendRows requests."
+                        )
+                if not chunks:
+                    # nothing to send — balance the enqueue count and move on
+                    # (defense in depth: the sink no longer enqueues empty batches)
+                    self.job_notifier.send(True)
+                    continue
+
                 # Stream/client setup lives INSIDE the protected block: in
                 # application-stream mode get_stream_components makes a network
                 # call (create_write_stream), and a transient failure there used
@@ -356,25 +383,6 @@ class StorageWriteBatchWorker(BaseWorker):
                 # 20 MB cap. Offsets advance per chunk (application streams need the
                 # exact running offset); backpressure applies inside the loop so a
                 # multi-chunk job cannot flood the in-flight window.
-                # logger (not log_notifier): notifier messages are only drained during
-                # drain_one, so end-of-pipe activity would be invisible in the logs.
-                chunks = list(chunk_proto_rows(job.data, self.max_request_bytes))
-                if job.dispatched == 0:
-                    # first attempt only: on a retry the original futures of the
-                    # already-dispatched chunks still decrement this counter, so
-                    # resetting it would corrupt the completion accounting.
-                    job.chunks_pending = len(chunks)
-                    if not chunks:
-                        # empty batch: nothing to await — balance the enqueue count
-                        self.job_notifier.send(True)
-                    if len(chunks) > 1:
-                        total_bytes = sum(len(r) for r in job.data.serialized_rows)
-                        self.logger.info(
-                            f"[{self.ext_id}] Batch of {len(job.data.serialized_rows)} rows"
-                            f" ({total_bytes:,} bytes) for {job.parent} exceeds"
-                            f" max_request_bytes={self.max_request_bytes:,};"
-                            f" splitting into {len(chunks)} AppendRows requests."
-                        )
                 # resume after the last successfully dispatched chunk: chunking
                 # is deterministic (same data, same limit), so indices are stable
                 # across attempts and in-flight chunks are never re-sent.
@@ -436,6 +444,12 @@ class StorageWriteBatchWorker(BaseWorker):
         for _, stream, _ in self.cache.values():
             try:
                 stream.close()
+            except bqstorage_exceptions.StreamClosedError:
+                # Cosmetic: the stream is already closed (or was never opened —
+                # bigquery-storage >= 2.3x raises here; 2.21 was silent).
+                # Reporting it as a worker error aborted every sink's MERGE at
+                # end-of-pipe (PR #9 report, reproduced 2026-07-15).
+                pass
             except Exception as exc:
                 self.error_notifier.send((exc, self.serialize_exception(exc)))
 
@@ -676,19 +690,25 @@ class BigQueryStorageWriteSink(BaseBigQuerySink):
                 raise
 
     def process_batch(self, context: Dict[str, Any]) -> None:
-        while self.global_queue.qsize() >= self.MAX_JOBS_QUEUED:
-            self.logger.warn(f"Max jobs enqueued reached ({self.MAX_JOBS_QUEUED})")
-            sleep(1)
+        # A batch whose only rows took the Load Job fallback leaves an EMPTY
+        # ProtoRows. Enqueuing it opens an AppendRows stream that never sends;
+        # closing that virgin stream raises StreamClosedError on
+        # google-cloud-bigquery-storage >= 2.3x, which aborted every sink's
+        # MERGE at end-of-pipe (PR #9 report, reproduced 2026-07-15).
+        if self.proto_rows.serialized_rows:
+            while self.global_queue.qsize() >= self.MAX_JOBS_QUEUED:
+                self.logger.warn(f"Max jobs enqueued reached ({self.MAX_JOBS_QUEUED})")
+                sleep(1)
 
-        self.global_queue.put(
-            Job(
-                parent=self.parent,
-                template=self.template,
-                data=self.proto_rows,
-                stream_notifier=self.stream_notifier,
+            self.global_queue.put(
+                Job(
+                    parent=self.parent,
+                    template=self.template,
+                    data=self.proto_rows,
+                    stream_notifier=self.stream_notifier,
+                )
             )
-        )
-        self.increment_jobs_enqueued()
+            self.increment_jobs_enqueued()
         # Upload any oversized rows collected during this batch (non-blocking:
         # completion is awaited in pre_state_hook/clean_up).
         self._flush_fallback_buffer()
