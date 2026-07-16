@@ -748,6 +748,15 @@ class BigQueryStorageWriteSink(BaseBigQuerySink):
         self.commit_streams()
         self._wait_for_fallback_jobs()
 
+    def checkpoint(self) -> None:
+        # Durability barrier before the mid-run MERGE: commit any application
+        # streams (no-op for _default) and await oversized-row fallback Load
+        # Jobs, so every staged row is in the temp before we merge. Mirrors
+        # clean_up() above, but for the non-terminal, repeatable checkpoint.
+        self.commit_streams()
+        self._wait_for_fallback_jobs()
+        super().checkpoint()
+
 
 def _stringify_json_columns(record: Dict[str, Any], fields: List[Any]) -> Dict[str, Any]:
     """Serialize values bound for BigQuery JSON columns to strings, recursively.

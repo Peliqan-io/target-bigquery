@@ -974,3 +974,27 @@ def test_checkpoint_noop_when_no_merge_target(monkeypatch):
                         lambda self: (_ for _ in ()).throw(AssertionError("rotated")))
     s.checkpoint()                                # must not raise / not rotate
     assert not s.client.query.called
+
+
+# --------------------------------------------------------------------------- #
+# checkpoint() barrier override for storage_write (PQ-3547)                    #
+# --------------------------------------------------------------------------- #
+def test_storage_write_checkpoint_barrier_before_merge(monkeypatch):
+    """storage_write must commit streams + await fallback Load Jobs BEFORE the
+    MERGE runs (order matters: rows must be durable in the temp first)."""
+    from target_bigquery.storage_write import BigQueryStorageWriteDenormalizedSink as SW
+    import target_bigquery.core as core
+
+    # BigQueryStorageWriteDenormalizedSink is not abstract (unlike
+    # BaseBigQuerySink), so __new__ works directly without a concrete subclass.
+    s = SW.__new__(SW)
+    calls = []
+    s.commit_streams = lambda: calls.append("commit")
+    s._wait_for_fallback_jobs = lambda: calls.append("fallback")
+    # Base checkpoint() (Task 1) records "merge"; patched via monkeypatch so
+    # it's restored automatically even if the assertion below fails.
+    monkeypatch.setattr(core.BaseBigQuerySink, "checkpoint", lambda self: calls.append("merge"))
+
+    SW.checkpoint(s)
+
+    assert calls == ["commit", "fallback", "merge"]
