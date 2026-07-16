@@ -318,6 +318,8 @@ class BaseBigQuerySink(BatchSink):
             "schema_resolver_version": SchemaResolverVersion(self.config.get("schema_resolver_version", 2)),
         }
         self.table = BigQueryTable(name=self.table_name, **opts)
+        self._staging_opts = opts
+        self._staging_seq = 0
         self.create_target(key_properties=key_properties)
         self.update_schema()
         self.merge_target: Optional[BigQueryTable] = None
@@ -331,40 +333,10 @@ class BaseBigQuerySink(BatchSink):
             and self._is_upsert_candidate()
         ):
             self.merge_target = copy(self.table)
-            self.table = BigQueryTable(name=f"{self.table_name}__{int(time.time())}", **opts)
-            self.table.create_table(
-                self.client,
-                self.apply_transforms,
-                **{
-                    "table": {
-                        "expires": datetime.datetime.now() + datetime.timedelta(days=1),
-                    },
-                    "dataset": {
-                        "location": self.config.get(
-                            "location", BigQueryTable.default_dataset_options()["location"]
-                        )
-                    },
-                },
-            )
-            time.sleep(2.5)  # Wait for eventual consistency
+            self._new_staging_table()
         elif self._is_overwrite_candidate():
             self.overwrite_target = copy(self.table)
-            self.table = BigQueryTable(name=f"{self.table_name}__{int(time.time())}", **opts)
-            self.table.create_table(
-                self.client,
-                self.apply_transforms,
-                **{
-                    "table": {
-                        "expires": datetime.datetime.now() + datetime.timedelta(days=1),
-                    },
-                    "dataset": {
-                        "location": self.config.get(
-                            "location", BigQueryTable.default_dataset_options()["location"]
-                        )
-                    },
-                },
-            )
-            time.sleep(2.5)  # Wait for eventual consistency
+            self._new_staging_table()
 
         self.global_par_typ = target.par_typ
         self.global_queue = target.queue
@@ -512,55 +484,82 @@ class BaseBigQuerySink(BatchSink):
         """Return a worker class for the given parallelization type."""
         raise NotImplementedError
 
+    def _new_staging_table(self) -> None:
+        """Create a fresh temp staging table and point self.table at it.
+
+        Used at init (first staging table) and by checkpoint() to rotate a new
+        temp in after each mid-run MERGE, so subsequent records for this stream
+        keep staging safely. A monotonic seq avoids same-second name clashes."""
+        self._staging_seq += 1
+        name = f"{self.table_name}__{int(time.time())}_{self._staging_seq}"
+        self.table = BigQueryTable(name=name, **self._staging_opts)
+        self.table.create_table(
+            self.client,
+            self.apply_transforms,
+            **{
+                "table": {"expires": datetime.datetime.now() + datetime.timedelta(days=1)},
+                "dataset": {
+                    "location": self.config.get(
+                        "location", BigQueryTable.default_dataset_options()["location"]
+                    )
+                },
+            },
+        )
+        time.sleep(2.5)  # Wait for eventual consistency
+
+    def _merge_staging_into_target(self) -> None:
+        """Dedupe + MERGE the current temp table into merge_target. Raises on
+        failure — never drops the temp, never swallows (PQ-3547: a failed MERGE
+        must not advance the bookmark or silently lose the staged batch)."""
+        target = self.merge_target.as_table()
+        date_columns = ["_sdc_extracted_at", "_sdc_received_at"]
+        tmp, ctas_tmp = None, "SELECT 1 AS _no_op"
+        if self._is_dedupe_before_upsert_candidate():
+            # We can't use MERGE with a non-unique key, so we need to dedupe the temp table into
+            # a _SESSION scoped intermediate table.
+            tmp = f"{self.merge_target.name}__tmp"
+            dedupe_query = (
+                f"SELECT * FROM {self.table.get_escaped_name()} "
+                f"QUALIFY ROW_NUMBER() OVER (PARTITION BY {', '.join(self.key_properties)} "
+                f"ORDER BY COALESCE({', '.join(date_columns)}) DESC) = 1"
+            )
+            ctas_tmp = f"CREATE OR REPLACE TEMP TABLE `{tmp}` AS {dedupe_query}"
+        merge_clause = (
+            f"MERGE `{self.merge_target}` AS target USING `{tmp or self.table}` AS source ON "
+            + " AND ".join(f"target.`{f}` = source.`{f}`" for f in self.key_properties)
+        )
+        update_clause = "UPDATE SET " + ", ".join(
+            f"target.`{f.name}` = source.`{f.name}`" for f in target.schema
+        )
+        insert_clause = (
+            f"INSERT ({', '.join(f'`{f.name}`' for f in target.schema)}) "
+            f"VALUES ({', '.join(f'source.`{f.name}`' for f in target.schema)})"
+        )
+        merge_sql = (
+            f"{ctas_tmp}; {merge_clause} "
+            f"WHEN MATCHED THEN {update_clause} "
+            f"WHEN NOT MATCHED THEN {insert_clause}; "
+            f"DROP TABLE IF EXISTS {self.table.get_escaped_name()};"
+        )
+        self.client.query(merge_sql).result()
+
+    def checkpoint(self) -> None:
+        """Mid-run: MERGE staged rows into the real table and rotate a fresh
+        temp. Repeatable and non-destructive (merge_target is preserved).
+        No-op unless this is a merge/upsert stream. Callers must have run the
+        per-method durability barrier first (workers joined, appends resolved,
+        fallback jobs awaited)."""
+        if self.merge_target is None:
+            return
+        self._merge_staging_into_target()
+        self._new_staging_table()
+
     def clean_up(self) -> None:
-        """Clean up the target table."""
+        """Finalize at end-of-pipe: MERGE (or overwrite) staging into target,
+        then tear down. Unlike checkpoint(), this is the terminal step."""
         if self.merge_target is not None:
             # We must merge the temp table into the target table.
-            target = self.merge_target.as_table()
-            date_columns = ["_sdc_extracted_at", "_sdc_received_at"]
-            tmp, ctas_tmp = None, "SELECT 1 AS _no_op"
-            if self._is_dedupe_before_upsert_candidate():
-                # We can't use MERGE with a non-unique key, so we need to dedupe the temp table into
-                # a _SESSION scoped intermediate table.
-                tmp = f"{self.merge_target.name}__tmp"
-                dedupe_query = (
-                    f"SELECT * FROM {self.table.get_escaped_name()} "
-                    f"QUALIFY ROW_NUMBER() OVER (PARTITION BY {', '.join(self.key_properties)} "
-                    f"ORDER BY COALESCE({', '.join(date_columns)}) DESC) = 1"
-                )
-                ctas_tmp = f"CREATE OR REPLACE TEMP TABLE `{tmp}` AS {dedupe_query}"
-            merge_clause = (
-                f"MERGE `{self.merge_target}` AS target USING `{tmp or self.table}` AS source ON "
-                + " AND ".join(f"target.`{f}` = source.`{f}`" for f in self.key_properties)
-            )
-            update_clause = "UPDATE SET " + ", ".join(
-                f"target.`{f.name}` = source.`{f.name}`" for f in target.schema
-            )
-            insert_clause = (
-                f"INSERT ({', '.join(f'`{f.name}`' for f in target.schema)}) "
-                f"VALUES ({', '.join(f'source.`{f.name}`' for f in target.schema)})"
-            )
-            merge_sql = (
-                f"{ctas_tmp}; {merge_clause} "
-                f"WHEN MATCHED THEN {update_clause} "
-                f"WHEN NOT MATCHED THEN {insert_clause}; "
-                f"DROP TABLE IF EXISTS {self.table.get_escaped_name()};"
-            )
-            try:
-                self.client.query(merge_sql).result()
-            except Exception as exc:
-                self.logger.warning(
-                    "Merge failed for stream '%s', falling back to DROP of temp table '%s'. Error: %s",
-                    self.stream_name,
-                    self.table,
-                    exc,
-                )
-                try:
-                    self.client.query(
-                        f"DROP TABLE IF EXISTS {self.table.get_escaped_name()};"
-                    ).result()
-                except Exception:
-                    pass
+            self._merge_staging_into_target()
             self.table = self.merge_target
             self.merge_target = None
         elif self.overwrite_target is not None:

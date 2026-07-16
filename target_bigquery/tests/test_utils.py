@@ -894,3 +894,83 @@ def test_flush_skips_empty_record_lists():
     t, client = _run_flush({"Accounts": []})
     client.query.assert_not_called()
     assert t._delete_buffer == {}
+
+
+# --------------------------------------------------------------------------- #
+# checkpoint() — mid-run MERGE (PQ-3547)                                        #
+# --------------------------------------------------------------------------- #
+from copy import copy as _copy
+
+
+def _merge_sink():
+    """A BaseBigQuerySink-like object with merge staging, no __init__/BQ."""
+    from target_bigquery.core import BaseBigQuerySink, BigQueryTable, IngestionStrategy
+
+    # BaseBigQuerySink is abstract (process_batch/worker_cls_factory), so
+    # object.__new__ refuses to instantiate it directly. A trivial concrete
+    # subclass sidesteps that without changing any inherited behavior we
+    # exercise here (checkpoint()/_new_staging_table() are defined on the
+    # base class itself).
+    class _ConcreteSink(BaseBigQuerySink):
+        def process_batch(self, context):
+            raise NotImplementedError
+
+        @staticmethod
+        def worker_cls_factory(worker_executor_cls, config):
+            raise NotImplementedError
+
+    s = _ConcreteSink.__new__(_ConcreteSink)
+    s.client = MagicMock()
+    s.stream_name = "SalesInvoiceLines"
+    s._key_properties = ["id"]  # key_properties is a read-only property in the SDK base
+    s._config = {"project": "p", "dataset": "d"}  # config is also a read-only property
+    opts = {
+        "project": "p", "dataset": "d", "jsonschema": {"properties": {}},
+        "transforms": {}, "ingestion_strategy": IngestionStrategy.DENORMALIZED,
+    }
+    s._staging_opts = opts
+    s._staging_seq = 0
+    real = BigQueryTable(name="salesinvoicelines", **opts)
+    s.merge_target = _copy(real)
+    s.table = BigQueryTable(name="salesinvoicelines__100", **opts)
+    # apply_transforms is a read-only property (derived from ingestion_strategy)
+    # and is unused by checkpoint()/_merge_staging_into_target(); not set here.
+    return s
+
+
+def test_checkpoint_merges_and_rotates_temp_without_teardown(monkeypatch):
+    s = _merge_sink()
+    # stub dedupe/merge to avoid building real SQL/schema
+    monkeypatch.setattr(type(s), "_is_dedupe_before_upsert_candidate", lambda self: False)
+    created = []
+    monkeypatch.setattr(type(s), "_new_staging_table",
+                        lambda self: created.append(True))
+    prev_target = s.merge_target
+    s.checkpoint()
+    assert s.client.query.called                 # a MERGE was issued
+    assert created == [True]                      # fresh temp rotated in
+    assert s.merge_target is prev_target          # merge_target NOT torn down
+
+
+def test_checkpoint_raises_and_does_not_drop_on_merge_failure(monkeypatch):
+    s = _merge_sink()
+    monkeypatch.setattr(type(s), "_is_dedupe_before_upsert_candidate", lambda self: False)
+    monkeypatch.setattr(type(s), "_new_staging_table", lambda self: None)
+    s.client.query.side_effect = Exception("schema mismatch")
+    with pytest.raises(Exception):
+        s.checkpoint()
+    # Exactly one query call was made (the failed MERGE attempt) and no
+    # separate standalone DROP-only query was issued afterward. (The old
+    # buggy code issued a second "DROP TABLE IF EXISTS ..." query in its
+    # except clause; merge_sql itself legitimately ENDS with a DROP TABLE
+    # statement, so asserting on substring "DROP TABLE" would be wrong here.)
+    assert s.client.query.call_count == 1
+
+
+def test_checkpoint_noop_when_no_merge_target(monkeypatch):
+    s = _merge_sink()
+    s.merge_target = None
+    monkeypatch.setattr(type(s), "_new_staging_table",
+                        lambda self: (_ for _ in ()).throw(AssertionError("rotated")))
+    s.checkpoint()                                # must not raise / not rotate
+    assert not s.client.query.called
