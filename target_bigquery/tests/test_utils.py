@@ -1078,3 +1078,56 @@ def test_drain_all_non_endofpipe_checkpoints_and_resets_counter():
     sink.clean_up.assert_not_called()  # not a teardown
     assert t._records_since_checkpoint == 0  # window reset
     t._write_state_message.assert_called_once()
+
+
+# --------------------------------------------------------------------------- #
+# per-stream checkpoint failure isolation + bookmark roll-back (PQ-3547)      #
+# --------------------------------------------------------------------------- #
+def _isolation_target(sinks, is_endofpipe):
+    from target_bigquery.target import TargetBigQuery
+
+    t = TargetBigQuery.__new__(TargetBigQuery)
+    t._config = {"project": "p", "dataset": "d"}
+    t._latest_state = {"bookmarks": {"A": {"v": 10}, "B": {"v": 20}}}
+    t._last_committed_state = {"bookmarks": {"A": {"v": 1}, "B": {"v": 2}}}
+    t._checkpoint_failures = set()
+    t._sinks_active = sinks
+    t.workers = []
+    t.max_parallelism = 1
+    t._delete_buffer = {}
+    t._records_since_checkpoint = 0
+    t._drain_all = MagicMock()
+    t._raise_pending_worker_error = MagicMock()
+    t._reset_max_record_age = MagicMock()
+    t._written = {}
+    t._write_state_message = lambda s: t._written.update(s)
+    return t
+
+
+def test_failed_stream_bookmark_rolled_back_others_advance():
+    good = MagicMock()
+    good.stream_name = "A"
+    bad = MagicMock()
+    bad.stream_name = "B"
+    bad.checkpoint.side_effect = Exception("merge failed")
+    t = _isolation_target({"A": good, "B": bad}, is_endofpipe=False)
+    t.drain_all(is_endofpipe=False)
+    # A advanced to latest, B rolled back to last committed
+    assert t._written["bookmarks"]["A"] == {"v": 10}
+    assert t._written["bookmarks"]["B"] == {"v": 2}
+    assert "B" in t._checkpoint_failures
+
+
+def test_endofpipe_raises_if_any_stream_failed():
+    from target_bigquery.target import CheckpointError
+
+    good = MagicMock()
+    good.stream_name = "A"
+    bad = MagicMock()
+    bad.stream_name = "B"
+    bad.clean_up.side_effect = Exception("merge failed")
+    t = _isolation_target({"A": good, "B": bad}, is_endofpipe=True)
+    with pytest.raises(CheckpointError):
+        t.drain_all(is_endofpipe=True)
+    # state was still written (good stream A persisted) before raising
+    assert t._written["bookmarks"]["A"] == {"v": 10}

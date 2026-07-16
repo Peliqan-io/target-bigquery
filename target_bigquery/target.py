@@ -55,6 +55,11 @@ WORKER_CAPACITY_FACTOR = 5
 WORKER_CREATION_MIN_INTERVAL = 5
 """Minimum time between worker creation attempts."""
 
+
+class CheckpointError(Exception):
+    """One or more streams failed to MERGE; their bookmarks were held back."""
+
+
 class TargetBigQuery(Target):
     """Target for BigQuery."""
 
@@ -390,6 +395,11 @@ class TargetBigQuery(Target):
         # threshold triggers a non-endofpipe drain_all() (MERGE + emit state).
         self._checkpoint_row_threshold = int(self.config.get("checkpoint_row_threshold", 10_000))
         self._records_since_checkpoint = 0
+        # Per-stream checkpoint failure isolation (PQ-3547): the last state we
+        # successfully wrote (so a failed stream's bookmark can be rolled back
+        # to it), and the set of streams that failed to MERGE this run.
+        self._last_committed_state: dict = {"bookmarks": {}}
+        self._checkpoint_failures: set = set()
 
     def increment_jobs_enqueued(self) -> None:
         """Increment the number of jobs enqueued."""
@@ -607,14 +617,12 @@ class TargetBigQuery(Target):
                 worker.join()
                 worker = self.workers.pop()
             self._raise_pending_worker_error()
-            for sink in self._sinks_active.values():
-                sink.clean_up()
+            self._run_sink_finalizers(state, endofpipe=True)
         else:
             for worker in self.workers:
                 worker.join()
             self._raise_pending_worker_error()
-            for sink in self._sinks_active.values():
-                sink.checkpoint()
+            self._run_sink_finalizers(state, endofpipe=False)
             self._records_since_checkpoint = 0
         # Apply buffered DELETERECORDs *before* advancing state, so the bookmark
         # never moves past deletes that were not applied. At end-of-pipe this runs
@@ -625,7 +633,42 @@ class TargetBigQuery(Target):
             self._flush_deletes()
         if state:
             self._write_state_message(state)
+            self._last_committed_state = copy.deepcopy(state)
         self._reset_max_record_age()
+        if is_endofpipe and self._checkpoint_failures:
+            raise CheckpointError(
+                "streams failed to merge, bookmarks held back: "
+                f"{sorted(self._checkpoint_failures)}"
+            )
+
+    def _run_sink_finalizers(self, state: dict, endofpipe: bool) -> None:
+        """Checkpoint (mid-run) or clean_up (end-of-pipe) each active sink,
+        isolating failures per-stream (PQ-3547).
+
+        A failed stream's bookmark subtree in `state["bookmarks"]` is rolled
+        back to its last successfully-committed value (or dropped if it was
+        never committed), so that stream is retried from its last-known-good
+        position on the next run. Other streams still advance. Never drops
+        data, never fails silently -- the failure is recorded in
+        `self._checkpoint_failures` and logged; `drain_all` raises
+        `CheckpointError` at end-of-pipe if any stream failed."""
+        for sink in self._sinks_active.values():
+            try:
+                sink.clean_up() if endofpipe else sink.checkpoint()
+            except Exception as exc:  # noqa: BLE001 - isolate one stream's failure
+                name = sink.stream_name
+                self._checkpoint_failures.add(name)
+                self.logger.error(
+                    "Checkpoint failed for stream '%s'; holding its bookmark. %s",
+                    name,
+                    exc,
+                )
+                bookmarks = state.setdefault("bookmarks", {})
+                last_bookmarks = self._last_committed_state.get("bookmarks", {})
+                if name in last_bookmarks:
+                    bookmarks[name] = copy.deepcopy(last_bookmarks[name])
+                else:
+                    bookmarks.pop(name, None)
 
     def _raise_pending_worker_error(self) -> None:
         """Surface worker errors that arrived after the last drain_one poll.
