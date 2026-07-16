@@ -551,21 +551,47 @@ class TargetBigQuery(Target):
         super()._process_record_message(message_dict)
         self._records_since_checkpoint += 1
 
+    def _method_supports_checkpoint(self) -> bool:
+        """Whether the configured target method supports the non-destructive
+        checkpoint()/MERGE path PQ-3547 relies on. Only `batch_job` and
+        `storage_write_api` do; `gcs_stage` and `streaming_insert` keep their
+        origin/master mid-run behavior. The default method is
+        `storage_write_api`."""
+        return self.config.get("method", "storage_write_api") in (
+            "batch_job",
+            "storage_write_api",
+        )
+
+    def _sink_checkpoint_eligible(self, sink: "BaseBigQuerySink") -> bool:
+        """Whether an individual active sink may be checkpointed (MERGE) on a
+        mid-run drain. Eligible only when the method supports checkpointing AND
+        the sink is upserting (`merge_target is not None`) AND it is not an
+        overwrite sink (`overwrite_target is None`). An overwrite sink DROPs +
+        recreates the real table, and mid-run that would truncate/replace it
+        before end-of-pipe -- not this feature's contract.
+
+        Used per sink in drain_all()'s non-endofpipe branch: this is the gate
+        that also covers the singer-sdk max-age drain, which calls
+        drain_all(is_endofpipe=False) directly and bypasses the
+        _process_state_message trigger below."""
+        return (
+            self._method_supports_checkpoint()
+            and getattr(sink, "merge_target", None) is not None
+            and getattr(sink, "overwrite_target", None) is None
+        )
+
     def _row_threshold_checkpoint_eligible(self) -> bool:
         """Whether this run is in scope for PQ-3547 row-threshold mid-run
         checkpoints (MERGE + STATE at a category boundary).
 
-        Only `batch_job` and `storage_write_api` support the non-destructive
-        checkpoint()/MERGE path this feature relies on, and only when at
-        least one active sink is actually upserting (`merge_target is not
-        None`). `gcs_stage` and `streaming_insert` must keep their
-        origin/master behavior, as must overwrite-mode sinks (which DROP +
-        recreate the target table rather than MERGE into it) -- a mid-run
-        checkpoint of an overwrite sink would truncate/replace the real table
-        before end-of-pipe, which is not this feature's contract.
-        """
-        method = self.config.get("method", "storage_write_api")
-        if method not in ("batch_job", "storage_write_api"):
+        Requires the method to support checkpointing and at least one active
+        sink to be actually upserting (`merge_target is not None`). If ANY
+        active sink is in overwrite mode the whole run stays out of scope
+        (origin/master behavior) -- §5.3 trigger condition "no active sink is
+        in overwrite mode". The per-sink drain_all gate
+        (_sink_checkpoint_eligible) is finer-grained; this run-level gate only
+        decides whether the row-threshold trigger fires at all."""
+        if not self._method_supports_checkpoint():
             return False
         sinks = list(self._sinks_active.values())
         if any(getattr(sink, "overwrite_target", None) is not None for sink in sinks):
@@ -646,8 +672,21 @@ class TargetBigQuery(Target):
             for worker in self.workers:
                 worker.join()
             self._raise_pending_worker_error()
+            # Per-sink scope gate (PQ-3547 §5.3/§10). This branch also runs on
+            # the singer-sdk max-age timer (_handle_max_record_age ->
+            # drain_all(is_endofpipe=False)), which bypasses the
+            # _process_state_message trigger. Only checkpoint (MERGE) sinks that
+            # are genuinely in scope; every out-of-scope sink
+            # (gcs_stage/streaming_insert/overwrite) keeps its origin/master
+            # pre_state_hook() behavior, so a mid-run drain never MERGEs an
+            # empty staging table and advances the bookmark past data that is
+            # only durable at clean_up(). Fail-fast: no try/except -- the first
+            # checkpoint() error propagates before the counter reset and STATE.
             for sink in self._sinks_active.values():
-                sink.checkpoint()
+                if self._sink_checkpoint_eligible(sink):
+                    sink.checkpoint()
+                else:
+                    sink.pre_state_hook()
             self._records_since_checkpoint = 0
         # Apply buffered DELETERECORDs *before* advancing state, so the bookmark
         # never moves past deletes that were not applied. At end-of-pipe this runs

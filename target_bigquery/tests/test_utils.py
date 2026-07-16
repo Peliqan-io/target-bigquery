@@ -1293,13 +1293,26 @@ def test_no_row_threshold_checkpoint_when_no_sink_is_upserting(monkeypatch, meth
 # --------------------------------------------------------------------------- #
 # drain_all non-endofpipe path checkpoints (MERGE) + resets counter (PQ-3547) #
 # --------------------------------------------------------------------------- #
+def _checkpoint_mock_sink(merge_target=None, overwrite_target=None):
+    """A MagicMock sink with *real* merge_target/overwrite_target values.
+
+    A bare MagicMock's un-configured attribute is a truthy Mock (never None),
+    which would defeat the `merge_target is not None` / `overwrite_target is
+    None` scope checks the drain_all gate makes per sink. Setting them to real
+    values (object() or None) lets the eligibility predicate behave."""
+    s = MagicMock()
+    s.merge_target = merge_target
+    s.overwrite_target = overwrite_target
+    return s
+
+
 def test_drain_all_non_endofpipe_checkpoints_and_resets_counter():
     from target_bigquery.target import TargetBigQuery
 
     t = TargetBigQuery.__new__(TargetBigQuery)
     t._config = {"project": "p", "dataset": "d"}
     t._latest_state = {"bookmarks": {"A": 5}}
-    sink = MagicMock()
+    sink = _checkpoint_mock_sink(merge_target=object())  # eligible: upsert sink
     t._sinks_active = {"A": sink}
     t.workers = []
     t.max_parallelism = 1
@@ -1342,7 +1355,11 @@ def _failfast_target(sinks, is_endofpipe):
 
 
 def test_state_written_after_fully_successful_checkpoint():
-    sinks = OrderedDict(A=MagicMock(), B=MagicMock(), C=MagicMock())
+    sinks = OrderedDict(
+        A=_checkpoint_mock_sink(merge_target=object()),
+        B=_checkpoint_mock_sink(merge_target=object()),
+        C=_checkpoint_mock_sink(merge_target=object()),
+    )
     t = _failfast_target(sinks, is_endofpipe=False)
     t.drain_all(is_endofpipe=False)
     for sink in sinks.values():
@@ -1352,7 +1369,11 @@ def test_state_written_after_fully_successful_checkpoint():
 
 
 def test_first_sink_failure_no_state_later_sinks_not_checkpointed():
-    sinks = OrderedDict(A=MagicMock(), B=MagicMock(), C=MagicMock())
+    sinks = OrderedDict(
+        A=_checkpoint_mock_sink(merge_target=object()),
+        B=_checkpoint_mock_sink(merge_target=object()),
+        C=_checkpoint_mock_sink(merge_target=object()),
+    )
     sinks["A"].checkpoint.side_effect = Exception("merge failed")
     t = _failfast_target(sinks, is_endofpipe=False)
     with pytest.raises(Exception, match="merge failed"):
@@ -1365,7 +1386,11 @@ def test_first_sink_failure_no_state_later_sinks_not_checkpointed():
 
 
 def test_later_sink_failure_after_earlier_success_still_fails_fast():
-    sinks = OrderedDict(A=MagicMock(), B=MagicMock(), C=MagicMock())
+    sinks = OrderedDict(
+        A=_checkpoint_mock_sink(merge_target=object()),
+        B=_checkpoint_mock_sink(merge_target=object()),
+        C=_checkpoint_mock_sink(merge_target=object()),
+    )
     sinks["B"].checkpoint.side_effect = Exception("merge failed")
     t = _failfast_target(sinks, is_endofpipe=False)
     with pytest.raises(Exception, match="merge failed"):
@@ -1393,3 +1418,83 @@ def test_endofpipe_fully_successful_clean_up_writes_final_state():
     for sink in sinks.values():
         sink.clean_up.assert_called_once()
     t._write_state_message.assert_called_once_with({"bookmarks": {"A": 10, "B": 20, "C": 30}})
+
+
+# --------------------------------------------------------------------------- #
+# drain_all(is_endofpipe=False) per-sink scope gate (PQ-3547 §5.3/§10).        #
+#                                                                             #
+# singer-sdk's _handle_max_record_age() calls drain_all(is_endofpipe=False)   #
+# directly on a wall-clock timer, bypassing the _process_state_message trigger #
+# gate entirely. So the scope gate MUST also live inside drain_all's mid-run  #
+# branch, per sink: eligible (batch_job/storage_write upsert) sinks MERGE via #
+# checkpoint(); everything else (gcs_stage/streaming_insert/overwrite) keeps  #
+# its origin/master pre_state_hook() behavior so a mid-run drain can't MERGE  #
+# an empty staging table and advance the bookmark past GCS-only data.         #
+# --------------------------------------------------------------------------- #
+def _drain_target(sinks, method="storage_write_api"):
+    """A __init__-less TargetBigQuery wired for drain_all() mid-run tests."""
+    from target_bigquery.target import TargetBigQuery
+
+    t = TargetBigQuery.__new__(TargetBigQuery)
+    t._config = {"project": "p", "dataset": "d", "method": method}
+    t._latest_state = {"bookmarks": {"A": 5}}
+    t._sinks_active = sinks
+    t.workers = []
+    t.max_parallelism = 1
+    t._delete_buffer = {}
+    t._records_since_checkpoint = 42
+    t._drain_all = MagicMock()
+    t._raise_pending_worker_error = MagicMock()
+    t._write_state_message = MagicMock()
+    t._reset_max_record_age = MagicMock()
+    return t
+
+
+def test_drain_all_non_endofpipe_ineligible_method_uses_pre_state_hook():
+    # method=gcs_stage: even a sink with merge_target set is OUT of scope. The
+    # mid-run (max-age) drain must fall back to the origin/master pre_state_hook
+    # and must NOT checkpoint (which would MERGE an empty staging table and
+    # advance the bookmark past GCS-only data). STATE is still emitted.
+    sink = _checkpoint_mock_sink(merge_target=object())
+    t = _drain_target({"A": sink}, method="gcs_stage")
+    t.drain_all(is_endofpipe=False)
+    sink.pre_state_hook.assert_called_once()
+    sink.checkpoint.assert_not_called()
+    t._write_state_message.assert_called_once()
+
+
+def test_drain_all_non_endofpipe_overwrite_sink_uses_pre_state_hook():
+    # Overwrite sink under batch_job: eligible method, but overwrite_target set
+    # (and merge_target None) => out of scope. pre_state_hook, not checkpoint.
+    sink = _checkpoint_mock_sink(overwrite_target=object())
+    t = _drain_target({"A": sink}, method="batch_job")
+    t.drain_all(is_endofpipe=False)
+    sink.pre_state_hook.assert_called_once()
+    sink.checkpoint.assert_not_called()
+    t._write_state_message.assert_called_once()
+
+
+@pytest.mark.parametrize("method", ["batch_job", "storage_write_api"])
+def test_drain_all_non_endofpipe_eligible_sink_checkpoints(method):
+    # Eligible: batch_job/storage_write upsert sink (merge_target set, no
+    # overwrite) => checkpoint() MERGEs mid-run, pre_state_hook is not used,
+    # the record counter resets, and STATE is emitted.
+    sink = _checkpoint_mock_sink(merge_target=object())
+    t = _drain_target({"A": sink}, method=method)
+    t.drain_all(is_endofpipe=False)
+    sink.checkpoint.assert_called_once()
+    sink.pre_state_hook.assert_not_called()
+    assert t._records_since_checkpoint == 0
+    t._write_state_message.assert_called_once()
+
+
+def test_drain_all_non_endofpipe_eligible_checkpoint_failure_fails_fast():
+    # Fail-fast still holds on the gated mid-run path: an eligible sink whose
+    # checkpoint() raises propagates before STATE and before the counter reset.
+    sink = _checkpoint_mock_sink(merge_target=object())
+    sink.checkpoint.side_effect = Exception("merge failed")
+    t = _drain_target({"A": sink}, method="batch_job")
+    with pytest.raises(Exception, match="merge failed"):
+        t.drain_all(is_endofpipe=False)
+    t._write_state_message.assert_not_called()
+    assert t._records_since_checkpoint == 42  # not reset
