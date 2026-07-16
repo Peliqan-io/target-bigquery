@@ -591,12 +591,24 @@ class BigQueryStorageWriteSink(BaseBigQuerySink):
         self._fallback_rows = 0
         self._fallback_jobs: List[bigquery.LoadJob] = []
         self.open_streams: Set[Tuple[str, writer.AppendRowsStream]] = set()
+        self.stream_notification, self.stream_notifier = target.pipe_cls(False)
+        self._refresh_write_destination()
+
+    def _refresh_write_destination(self) -> None:
+        """(Re)compute the write destination from the CURRENT `self.table`.
+
+        `self.parent` and `self.template` (its embedded `write_stream`) both
+        encode the staging table generation. `BaseBigQuerySink.checkpoint()`
+        rotates `self.table` to a fresh staging table after a successful
+        MERGE, but does not know about these storage_write-specific
+        attributes — so this must be called both at __init__ time and again
+        immediately after every successful rotation (PQ-3547 C1), otherwise
+        already-queued/future Jobs keep targeting the dropped old generation."""
         self.parent = BigQueryWriteClient.table_path(
             self.table.project,
             self.table.dataset,
             self.table.name,
         )
-        self.stream_notification, self.stream_notifier = target.pipe_cls(False)
         self.template = generate_template(self.proto_schema)
 
     @property
@@ -756,6 +768,13 @@ class BigQueryStorageWriteSink(BaseBigQuerySink):
         self.commit_streams()
         self._wait_for_fallback_jobs()
         super().checkpoint()
+        # super().checkpoint() rotated self.table to a fresh staging table
+        # (PQ-3547 C1) — if it raised, we don't get here, and no rotation
+        # happened, so the old parent/template are still correct and must be
+        # left alone. On success, recompute parent/template from the NEW
+        # self.table so the next queued Job (and any post-rotation stream
+        # open) targets generation N+1, never the just-dropped generation N.
+        self._refresh_write_destination()
 
 
 def _stringify_json_columns(record: Dict[str, Any], fields: List[Any]) -> Dict[str, Any]:

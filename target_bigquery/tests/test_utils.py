@@ -982,7 +982,8 @@ def test_checkpoint_noop_when_no_merge_target(monkeypatch):
 # --------------------------------------------------------------------------- #
 def test_storage_write_checkpoint_barrier_before_merge(monkeypatch):
     """storage_write must commit streams + await fallback Load Jobs BEFORE the
-    MERGE runs (order matters: rows must be durable in the temp first)."""
+    MERGE runs (order matters: rows must be durable in the temp first), and
+    must refresh parent/template only AFTER the MERGE (rotation) succeeds."""
     from target_bigquery.storage_write import BigQueryStorageWriteDenormalizedSink as SW
     import target_bigquery.core as core
 
@@ -992,13 +993,131 @@ def test_storage_write_checkpoint_barrier_before_merge(monkeypatch):
     calls = []
     s.commit_streams = lambda: calls.append("commit")
     s._wait_for_fallback_jobs = lambda: calls.append("fallback")
+    s._refresh_write_destination = lambda: calls.append("refresh")
     # Base checkpoint() (Task 1) records "merge"; patched via monkeypatch so
     # it's restored automatically even if the assertion below fails.
     monkeypatch.setattr(core.BaseBigQuerySink, "checkpoint", lambda self: calls.append("merge"))
 
     SW.checkpoint(s)
 
-    assert calls == ["commit", "fallback", "merge"]
+    assert calls == ["commit", "fallback", "merge", "refresh"]
+
+
+# --------------------------------------------------------------------------- #
+# _refresh_write_destination() — generation rotation (PQ-3547 C1)              #
+# --------------------------------------------------------------------------- #
+def _sw_sink():
+    """A BigQueryStorageWriteDenormalizedSink-like object with no BQ/network
+    dependency, built the same way as `_merge_sink()` but with the storage_write
+    write-destination attributes (`parent`/`template`) initialized via
+    `_refresh_write_destination()`, mirroring what `__init__` now does."""
+    from target_bigquery.storage_write import BigQueryStorageWriteDenormalizedSink as SW
+    from target_bigquery.core import BigQueryTable, IngestionStrategy
+    from target_bigquery.proto_gen import proto_schema_factory_v2
+
+    s = SW.__new__(SW)
+    s.client = MagicMock()
+    s.stream_name = "SalesInvoiceLines"
+    s._key_properties = ["id"]  # key_properties is a read-only property in the SDK base
+    s._config = {"project": "p", "dataset": "d"}  # config is also a read-only property
+    opts = {
+        "project": "p", "dataset": "d", "jsonschema": {"properties": {}},
+        "transforms": {}, "ingestion_strategy": IngestionStrategy.DENORMALIZED,
+    }
+    s._staging_opts = opts
+    s._staging_seq = 0
+    real = BigQueryTable(name="salesinvoicelines", **opts)
+    s.merge_target = _copy(real)
+    s.table = BigQueryTable(name="salesinvoicelines__gen1_1", **opts)
+    # Bypass the real schema-translation path (irrelevant to rotation logic);
+    # a real proto message class is still used so generate_template's
+    # descriptor-embedding logic runs unmocked.
+    s._proto_schema = proto_schema_factory_v2([])
+    s.open_streams = set()
+    s._refresh_write_destination()  # what __init__ now does
+    return s
+
+
+def test_refresh_write_destination_parent_matches_current_table():
+    from google.cloud.bigquery_storage_v1 import BigQueryWriteClient
+
+    s = _sw_sink()
+    assert s.parent == BigQueryWriteClient.table_path("p", "d", "salesinvoicelines__gen1_1")
+
+
+def test_checkpoint_rotates_parent_and_template_to_generation_two(monkeypatch):
+    """After a successful checkpoint (MERGE + staging-table rotation), `parent`
+    must reference the NEW (generation-2) table and a fresh template object
+    must have been created — never the dropped generation-1 table/template."""
+    from google.cloud.bigquery_storage_v1 import BigQueryWriteClient
+    from target_bigquery.core import BigQueryTable
+    from target_bigquery.storage_write import BigQueryStorageWriteDenormalizedSink as SW
+    import target_bigquery.core as core
+    import target_bigquery.storage_write as sw
+
+    s = _sw_sink()
+    gen1_parent, gen1_template = s.parent, s.template
+    assert gen1_parent == BigQueryWriteClient.table_path("p", "d", "salesinvoicelines__gen1_1")
+
+    s.commit_streams = lambda: None
+    s._wait_for_fallback_jobs = lambda: None
+
+    def fake_super_checkpoint(self):
+        # Mirrors what BaseBigQuerySink.checkpoint() does on a successful
+        # MERGE: rotate self.table to a fresh staging table.
+        self.table = BigQueryTable(name="salesinvoicelines__gen2_1", **self._staging_opts)
+
+    monkeypatch.setattr(core.BaseBigQuerySink, "checkpoint", fake_super_checkpoint)
+    template_calls = []
+    real_generate_template = sw.generate_template
+    monkeypatch.setattr(
+        sw, "generate_template",
+        lambda schema: (template_calls.append(schema), real_generate_template(schema))[1],
+    )
+
+    SW.checkpoint(s)
+
+    expected_gen2_parent = BigQueryWriteClient.table_path("p", "d", "salesinvoicelines__gen2_1")
+    assert s.parent == expected_gen2_parent
+    assert s.parent != gen1_parent
+    assert s.template is not gen1_template
+    assert len(template_calls) == 1  # fresh template built exactly once, post-MERGE
+
+    # A Job created after this checkpoint carries the NEW parent, never the
+    # dropped generation-1 table.
+    job = sw.Job(parent=s.parent, template=s.template, stream_notifier=None, data=None)
+    assert job.parent == expected_gen2_parent
+    assert job.parent != gen1_parent
+
+
+def test_checkpoint_does_not_refresh_destination_when_merge_raises(monkeypatch):
+    """If the MERGE (super().checkpoint()) raises, no rotation happened, so
+    parent/template must be left pointing at the still-current staging table."""
+    from target_bigquery.storage_write import BigQueryStorageWriteDenormalizedSink as SW
+    import target_bigquery.core as core
+    import target_bigquery.storage_write as sw
+
+    s = _sw_sink()
+    gen1_parent, gen1_template = s.parent, s.template
+
+    s.commit_streams = lambda: None
+    s._wait_for_fallback_jobs = lambda: None
+    monkeypatch.setattr(
+        core.BaseBigQuerySink, "checkpoint",
+        lambda self: (_ for _ in ()).throw(Exception("merge failed")),
+    )
+    refresh_calls = []
+    monkeypatch.setattr(
+        sw.BigQueryStorageWriteSink, "_refresh_write_destination",
+        lambda self: refresh_calls.append(True),
+    )
+
+    with pytest.raises(Exception, match="merge failed"):
+        SW.checkpoint(s)
+
+    assert refresh_calls == []          # never reached — merge raised first
+    assert s.parent == gen1_parent      # unchanged: still generation 1
+    assert s.template is gen1_template  # unchanged: same template object
 
 
 class _FakeSink:
