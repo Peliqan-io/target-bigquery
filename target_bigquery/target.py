@@ -330,6 +330,18 @@ class TargetBigQuery(Target):
             ),
             allowed_values=[1, 2],
         ),
+        th.Property(
+            "checkpoint_row_threshold",
+            th.IntegerType,
+            default=10_000,
+            description=(
+                "The number of records to process (across all streams) before triggering a mid-run"
+                " checkpoint (MERGE staged rows into the target table and emit a STATE message) at"
+                " the next category/stream boundary. Only applies to merge/upsert streams. A value"
+                " of 0 checkpoints at every category boundary; a very large value effectively"
+                " disables mid-run checkpoints (only end-of-pipe finalizes)."
+            ),
+        ),
     ).to_dict()
 
     def __init__(self, *args, **kwargs) -> None:
@@ -373,6 +385,11 @@ class TargetBigQuery(Target):
         self.worker_pings: Dict[str, float] = {}
         self._jobs_enqueued = 0
         self._last_worker_creation = 0.0
+        # Mid-run checkpoint trigger (PQ-3547): count records across all
+        # streams since the last checkpoint; a STATE message at or past the
+        # threshold triggers a non-endofpipe drain_all() (MERGE + emit state).
+        self._checkpoint_row_threshold = int(self.config.get("checkpoint_row_threshold", 10_000))
+        self._records_since_checkpoint = 0
 
     def increment_jobs_enqueued(self) -> None:
         """Increment the number of jobs enqueued."""
@@ -527,6 +544,26 @@ class TargetBigQuery(Target):
             self._delete_buffer.setdefault(stream, []).append(record)
             return
         super()._process_unknown_message(message_dict)
+
+    def _process_record_message(self, message_dict: dict) -> None:
+        """Process a RECORD message, then tally it toward the checkpoint window."""
+        super()._process_record_message(message_dict)
+        self._records_since_checkpoint += 1
+
+    def _process_state_message(self, message_dict: dict) -> None:
+        """Process a STATE message (category/stream boundary), then checkpoint
+        mid-run if enough records have accrued since the last checkpoint.
+
+        threshold == 0 means every category boundary checkpoints (counter is
+        always >= 0). A very large threshold effectively disables mid-run
+        checkpoints (only max-age and end-of-pipe still finalize).
+        """
+        super()._process_state_message(message_dict)
+        if (
+            self._checkpoint_row_threshold >= 0
+            and self._records_since_checkpoint >= self._checkpoint_row_threshold
+        ):
+            self.drain_all(is_endofpipe=False)
 
     def drain_one(self, sink: Sink) -> None:  # type: ignore
         """Drain a sink. Includes a hook to manage the worker pool and notifications."""

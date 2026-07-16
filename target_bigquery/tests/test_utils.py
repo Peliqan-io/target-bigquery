@@ -998,3 +998,57 @@ def test_storage_write_checkpoint_barrier_before_merge(monkeypatch):
     SW.checkpoint(s)
 
     assert calls == ["commit", "fallback", "merge"]
+
+
+# --------------------------------------------------------------------------- #
+# checkpoint_row_threshold config + record counter + STATE trigger (PQ-3547)   #
+# --------------------------------------------------------------------------- #
+def _counter_target(threshold):
+    from target_bigquery.target import TargetBigQuery
+
+    t = TargetBigQuery.__new__(TargetBigQuery)
+    t._config = {"project": "p", "dataset": "d", "checkpoint_row_threshold": threshold}
+    t._records_since_checkpoint = 0
+    t._checkpoint_row_threshold = threshold
+    t._latest_state = {"bookmarks": {}}
+    t.drain_all = MagicMock()
+    return t
+
+
+def test_state_message_triggers_checkpoint_when_threshold_met(monkeypatch):
+    import target_bigquery.target as tgt
+
+    # Target (TargetBigQuery.__mro__[1]) defines the SDK base
+    # _process_state_message; stub it so our override's own logic (call
+    # super() then evaluate the trigger) is what's under test.
+    assert tgt.TargetBigQuery.__mro__[1].__name__ == "Target"
+    monkeypatch.setattr(
+        tgt.TargetBigQuery.__mro__[1], "_process_state_message", lambda self, m: None
+    )
+    t = _counter_target(threshold=3)
+    t._records_since_checkpoint = 3
+    t._process_state_message({"type": "STATE", "value": {"bookmarks": {"A": 1}}})
+    t.drain_all.assert_called_once_with(is_endofpipe=False)
+
+
+def test_state_message_no_checkpoint_below_threshold(monkeypatch):
+    import target_bigquery.target as tgt
+
+    monkeypatch.setattr(
+        tgt.TargetBigQuery.__mro__[1], "_process_state_message", lambda self, m: None
+    )
+    t = _counter_target(threshold=1000)
+    t._records_since_checkpoint = 10
+    t._process_state_message({"type": "STATE", "value": {}})
+    t.drain_all.assert_not_called()
+
+
+def test_record_message_increments_counter(monkeypatch):
+    import target_bigquery.target as tgt
+
+    monkeypatch.setattr(
+        tgt.TargetBigQuery.__mro__[1], "_process_record_message", lambda self, m: None
+    )
+    t = _counter_target(threshold=1000)
+    t._process_record_message({"type": "RECORD", "stream": "A", "record": {}})
+    assert t._records_since_checkpoint == 1
