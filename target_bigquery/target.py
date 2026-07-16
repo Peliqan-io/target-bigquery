@@ -56,10 +56,6 @@ WORKER_CREATION_MIN_INTERVAL = 5
 """Minimum time between worker creation attempts."""
 
 
-class CheckpointError(Exception):
-    """One or more streams failed to MERGE; their bookmarks were held back."""
-
-
 class TargetBigQuery(Target):
     """Target for BigQuery."""
 
@@ -395,11 +391,6 @@ class TargetBigQuery(Target):
         # threshold triggers a non-endofpipe drain_all() (MERGE + emit state).
         self._checkpoint_row_threshold = int(self.config.get("checkpoint_row_threshold", 10_000))
         self._records_since_checkpoint = 0
-        # Per-stream checkpoint failure isolation (PQ-3547): the last state we
-        # successfully wrote (so a failed stream's bookmark can be rolled back
-        # to it), and the set of streams that failed to MERGE this run.
-        self._last_committed_state: dict = {"bookmarks": {}}
-        self._checkpoint_failures: set = set()
 
     def increment_jobs_enqueued(self) -> None:
         """Increment the number of jobs enqueued."""
@@ -560,6 +551,27 @@ class TargetBigQuery(Target):
         super()._process_record_message(message_dict)
         self._records_since_checkpoint += 1
 
+    def _row_threshold_checkpoint_eligible(self) -> bool:
+        """Whether this run is in scope for PQ-3547 row-threshold mid-run
+        checkpoints (MERGE + STATE at a category boundary).
+
+        Only `batch_job` and `storage_write_api` support the non-destructive
+        checkpoint()/MERGE path this feature relies on, and only when at
+        least one active sink is actually upserting (`merge_target is not
+        None`). `gcs_stage` and `streaming_insert` must keep their
+        origin/master behavior, as must overwrite-mode sinks (which DROP +
+        recreate the target table rather than MERGE into it) -- a mid-run
+        checkpoint of an overwrite sink would truncate/replace the real table
+        before end-of-pipe, which is not this feature's contract.
+        """
+        method = self.config.get("method", "storage_write_api")
+        if method not in ("batch_job", "storage_write_api"):
+            return False
+        sinks = list(self._sinks_active.values())
+        if any(getattr(sink, "overwrite_target", None) is not None for sink in sinks):
+            return False
+        return any(getattr(sink, "merge_target", None) is not None for sink in sinks)
+
     def _process_state_message(self, message_dict: dict) -> None:
         """Process a STATE message (category/stream boundary), then checkpoint
         mid-run if enough records have accrued since the last checkpoint.
@@ -572,6 +584,7 @@ class TargetBigQuery(Target):
         if (
             self._checkpoint_row_threshold >= 0
             and self._records_since_checkpoint >= self._checkpoint_row_threshold
+            and self._row_threshold_checkpoint_eligible()
         ):
             self.drain_all(is_endofpipe=False)
 
@@ -605,7 +618,17 @@ class TargetBigQuery(Target):
 
     def drain_all(self, is_endofpipe: bool = False) -> None:  # type: ignore
         """Drain all sinks and write state message. If is_endofpipe, execute clean_up() on all sinks.
-        Includes an additional hook to allow sinks to do any pre-state message processing."""
+
+        Fail-fast checkpoint finalization (PQ-3547): sinks are finalized
+        (checkpoint() mid-run / clean_up() at end-of-pipe) in a plain loop
+        with no per-sink exception handling. The first failure propagates
+        immediately, before `_flush_deletes()` and before
+        `_write_state_message()` run, so a failed checkpoint/clean_up emits
+        no STATE for that boundary and the process exits non-zero. Earlier
+        sinks that already finalized successfully in the same loop are not
+        rolled back -- their data is durable and safe to replay (upsert +
+        dedupe), but no new STATE reflects them until a later run succeeds.
+        """
         state = copy.deepcopy(self._latest_state)
         sink: BaseBigQuerySink
         self._drain_all(list(self._sinks_active.values()), self.max_parallelism)
@@ -617,12 +640,14 @@ class TargetBigQuery(Target):
                 worker.join()
                 worker = self.workers.pop()
             self._raise_pending_worker_error()
-            self._run_sink_finalizers(state, endofpipe=True)
+            for sink in self._sinks_active.values():
+                sink.clean_up()
         else:
             for worker in self.workers:
                 worker.join()
             self._raise_pending_worker_error()
-            self._run_sink_finalizers(state, endofpipe=False)
+            for sink in self._sinks_active.values():
+                sink.checkpoint()
             self._records_since_checkpoint = 0
         # Apply buffered DELETERECORDs *before* advancing state, so the bookmark
         # never moves past deletes that were not applied. At end-of-pipe this runs
@@ -633,42 +658,7 @@ class TargetBigQuery(Target):
             self._flush_deletes()
         if state:
             self._write_state_message(state)
-            self._last_committed_state = copy.deepcopy(state)
         self._reset_max_record_age()
-        if is_endofpipe and self._checkpoint_failures:
-            raise CheckpointError(
-                "streams failed to merge, bookmarks held back: "
-                f"{sorted(self._checkpoint_failures)}"
-            )
-
-    def _run_sink_finalizers(self, state: dict, endofpipe: bool) -> None:
-        """Checkpoint (mid-run) or clean_up (end-of-pipe) each active sink,
-        isolating failures per-stream (PQ-3547).
-
-        A failed stream's bookmark subtree in `state["bookmarks"]` is rolled
-        back to its last successfully-committed value (or dropped if it was
-        never committed), so that stream is retried from its last-known-good
-        position on the next run. Other streams still advance. Never drops
-        data, never fails silently -- the failure is recorded in
-        `self._checkpoint_failures` and logged; `drain_all` raises
-        `CheckpointError` at end-of-pipe if any stream failed."""
-        for sink in self._sinks_active.values():
-            try:
-                sink.clean_up() if endofpipe else sink.checkpoint()
-            except Exception as exc:  # noqa: BLE001 - isolate one stream's failure
-                name = sink.stream_name
-                self._checkpoint_failures.add(name)
-                self.logger.error(
-                    "Checkpoint failed for stream '%s'; holding its bookmark. %s",
-                    name,
-                    exc,
-                )
-                bookmarks = state.setdefault("bookmarks", {})
-                last_bookmarks = self._last_committed_state.get("bookmarks", {})
-                if name in last_bookmarks:
-                    bookmarks[name] = copy.deepcopy(last_bookmarks[name])
-                else:
-                    bookmarks.pop(name, None)
 
     def _raise_pending_worker_error(self) -> None:
         """Surface worker errors that arrived after the last drain_one poll.

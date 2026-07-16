@@ -1,3 +1,4 @@
+from collections import OrderedDict
 from typing import List
 
 import pytest
@@ -1000,17 +1001,39 @@ def test_storage_write_checkpoint_barrier_before_merge(monkeypatch):
     assert calls == ["commit", "fallback", "merge"]
 
 
+class _FakeSink:
+    """Minimal stand-in for a BaseBigQuerySink used only to carry
+    merge_target/overwrite_target for scope-gating checks (§5.3). Not a
+    MagicMock, since a MagicMock's un-configured attribute access returns a
+    truthy Mock rather than None, which would defeat the `is not None`
+    checks under test."""
+
+    def __init__(self, merge_target=None, overwrite_target=None):
+        self.merge_target = merge_target
+        self.overwrite_target = overwrite_target
+
+
 # --------------------------------------------------------------------------- #
 # checkpoint_row_threshold config + record counter + STATE trigger (PQ-3547)   #
 # --------------------------------------------------------------------------- #
-def _counter_target(threshold):
+def _counter_target(threshold, method="batch_job", sinks_active=None):
     from target_bigquery.target import TargetBigQuery
 
     t = TargetBigQuery.__new__(TargetBigQuery)
-    t._config = {"project": "p", "dataset": "d", "checkpoint_row_threshold": threshold}
+    t._config = {
+        "project": "p",
+        "dataset": "d",
+        "checkpoint_row_threshold": threshold,
+        "method": method,
+    }
     t._records_since_checkpoint = 0
     t._checkpoint_row_threshold = threshold
     t._latest_state = {"bookmarks": {}}
+    # Default: one eligible (upserting) sink, so threshold tests exercise only
+    # the counter/threshold logic. Scope-gating tests override this.
+    t._sinks_active = (
+        sinks_active if sinks_active is not None else {"A": _FakeSink(merge_target=object())}
+    )
     t.drain_all = MagicMock()
     return t
 
@@ -1054,6 +1077,100 @@ def test_record_message_increments_counter(monkeypatch):
     assert t._records_since_checkpoint == 1
 
 
+@pytest.mark.parametrize("threshold", [0, 1])
+def test_threshold_zero_checkpoints_every_boundary_positive_coalesces(monkeypatch, threshold):
+    import target_bigquery.target as tgt
+
+    monkeypatch.setattr(
+        tgt.TargetBigQuery.__mro__[1], "_process_state_message", lambda self, m: None
+    )
+    t = _counter_target(threshold=threshold)
+    t._records_since_checkpoint = 0
+    # threshold 0: 0 >= 0 -> every boundary checkpoints.
+    # threshold 1: 0 >= 1 is False -> this boundary does NOT checkpoint yet.
+    t._process_state_message({"type": "STATE", "value": {}})
+    if threshold == 0:
+        t.drain_all.assert_called_once_with(is_endofpipe=False)
+    else:
+        t.drain_all.assert_not_called()
+
+
+# --------------------------------------------------------------------------- #
+# row-threshold trigger scope gating (§5.3): only batch_job/storage_write_api #
+# with an active upsert (merge_target) sink, and never with an overwrite     #
+# sink, may take the mid-run row-threshold checkpoint path.                  #
+# --------------------------------------------------------------------------- #
+@pytest.mark.parametrize("method", ["gcs_stage", "streaming_insert"])
+def test_no_row_threshold_checkpoint_for_out_of_scope_methods(monkeypatch, method):
+    import target_bigquery.target as tgt
+
+    monkeypatch.setattr(
+        tgt.TargetBigQuery.__mro__[1], "_process_state_message", lambda self, m: None
+    )
+    t = _counter_target(
+        threshold=0,
+        method=method,
+        sinks_active={"A": _FakeSink(merge_target=object())},
+    )
+    t._records_since_checkpoint = 0
+    t._process_state_message({"type": "STATE", "value": {}})
+    t.drain_all.assert_not_called()
+
+
+@pytest.mark.parametrize("method", ["batch_job", "storage_write_api"])
+def test_no_row_threshold_checkpoint_when_a_sink_is_overwrite_mode(monkeypatch, method):
+    import target_bigquery.target as tgt
+
+    monkeypatch.setattr(
+        tgt.TargetBigQuery.__mro__[1], "_process_state_message", lambda self, m: None
+    )
+    t = _counter_target(
+        threshold=0,
+        method=method,
+        sinks_active={
+            "A": _FakeSink(merge_target=object()),
+            "B": _FakeSink(overwrite_target=object()),
+        },
+    )
+    t._records_since_checkpoint = 0
+    t._process_state_message({"type": "STATE", "value": {}})
+    t.drain_all.assert_not_called()
+
+
+@pytest.mark.parametrize("method", ["batch_job", "storage_write_api"])
+def test_row_threshold_checkpoint_eligible_for_batch_job_and_storage_write_upsert(
+    monkeypatch, method
+):
+    import target_bigquery.target as tgt
+
+    monkeypatch.setattr(
+        tgt.TargetBigQuery.__mro__[1], "_process_state_message", lambda self, m: None
+    )
+    t = _counter_target(
+        threshold=0,
+        method=method,
+        sinks_active={"A": _FakeSink(merge_target=object())},
+    )
+    t._records_since_checkpoint = 0
+    t._process_state_message({"type": "STATE", "value": {}})
+    t.drain_all.assert_called_once_with(is_endofpipe=False)
+
+
+@pytest.mark.parametrize("method", ["batch_job", "storage_write_api"])
+def test_no_row_threshold_checkpoint_when_no_sink_is_upserting(monkeypatch, method):
+    """Pure append-mode sinks (no merge_target, no overwrite_target) are not
+    in scope either -- there is nothing for checkpoint()/MERGE to do."""
+    import target_bigquery.target as tgt
+
+    monkeypatch.setattr(
+        tgt.TargetBigQuery.__mro__[1], "_process_state_message", lambda self, m: None
+    )
+    t = _counter_target(threshold=0, method=method, sinks_active={"A": _FakeSink()})
+    t._records_since_checkpoint = 0
+    t._process_state_message({"type": "STATE", "value": {}})
+    t.drain_all.assert_not_called()
+
+
 # --------------------------------------------------------------------------- #
 # drain_all non-endofpipe path checkpoints (MERGE) + resets counter (PQ-3547) #
 # --------------------------------------------------------------------------- #
@@ -1081,53 +1198,79 @@ def test_drain_all_non_endofpipe_checkpoints_and_resets_counter():
 
 
 # --------------------------------------------------------------------------- #
-# per-stream checkpoint failure isolation + bookmark roll-back (PQ-3547)      #
+# fail-fast checkpoint finalization (PQ-3547 §5.2/§7): the first sink.checkpoint()
+# / sink.clean_up() failure propagates immediately with no try/except around
+# the sink loop. Earlier successful sinks in the same boundary are NOT rolled
+# back, but no STATE is written for that boundary and later sinks are not
+# finalized (fail-fast, not per-stream isolation).                            #
 # --------------------------------------------------------------------------- #
-def _isolation_target(sinks, is_endofpipe):
+def _failfast_target(sinks, is_endofpipe):
     from target_bigquery.target import TargetBigQuery
 
     t = TargetBigQuery.__new__(TargetBigQuery)
     t._config = {"project": "p", "dataset": "d"}
-    t._latest_state = {"bookmarks": {"A": {"v": 10}, "B": {"v": 20}}}
-    t._last_committed_state = {"bookmarks": {"A": {"v": 1}, "B": {"v": 2}}}
-    t._checkpoint_failures = set()
+    t._latest_state = {"bookmarks": {"A": 10, "B": 20, "C": 30}}
     t._sinks_active = sinks
     t.workers = []
     t.max_parallelism = 1
     t._delete_buffer = {}
-    t._records_since_checkpoint = 0
+    t._records_since_checkpoint = 42
     t._drain_all = MagicMock()
     t._raise_pending_worker_error = MagicMock()
     t._reset_max_record_age = MagicMock()
-    t._written = {}
-    t._write_state_message = lambda s: t._written.update(s)
+    t._write_state_message = MagicMock()
     return t
 
 
-def test_failed_stream_bookmark_rolled_back_others_advance():
-    good = MagicMock()
-    good.stream_name = "A"
-    bad = MagicMock()
-    bad.stream_name = "B"
-    bad.checkpoint.side_effect = Exception("merge failed")
-    t = _isolation_target({"A": good, "B": bad}, is_endofpipe=False)
+def test_state_written_after_fully_successful_checkpoint():
+    sinks = OrderedDict(A=MagicMock(), B=MagicMock(), C=MagicMock())
+    t = _failfast_target(sinks, is_endofpipe=False)
     t.drain_all(is_endofpipe=False)
-    # A advanced to latest, B rolled back to last committed
-    assert t._written["bookmarks"]["A"] == {"v": 10}
-    assert t._written["bookmarks"]["B"] == {"v": 2}
-    assert "B" in t._checkpoint_failures
+    for sink in sinks.values():
+        sink.checkpoint.assert_called_once()
+    t._write_state_message.assert_called_once_with({"bookmarks": {"A": 10, "B": 20, "C": 30}})
+    assert t._records_since_checkpoint == 0
 
 
-def test_endofpipe_raises_if_any_stream_failed():
-    from target_bigquery.target import CheckpointError
+def test_first_sink_failure_no_state_later_sinks_not_checkpointed():
+    sinks = OrderedDict(A=MagicMock(), B=MagicMock(), C=MagicMock())
+    sinks["A"].checkpoint.side_effect = Exception("merge failed")
+    t = _failfast_target(sinks, is_endofpipe=False)
+    with pytest.raises(Exception, match="merge failed"):
+        t.drain_all(is_endofpipe=False)
+    sinks["B"].checkpoint.assert_not_called()
+    sinks["C"].checkpoint.assert_not_called()
+    t._write_state_message.assert_not_called()
+    # Counter reset happens after the checkpoint loop, so a failure must skip it.
+    assert t._records_since_checkpoint == 42
 
-    good = MagicMock()
-    good.stream_name = "A"
-    bad = MagicMock()
-    bad.stream_name = "B"
-    bad.clean_up.side_effect = Exception("merge failed")
-    t = _isolation_target({"A": good, "B": bad}, is_endofpipe=True)
-    with pytest.raises(CheckpointError):
+
+def test_later_sink_failure_after_earlier_success_still_fails_fast():
+    sinks = OrderedDict(A=MagicMock(), B=MagicMock(), C=MagicMock())
+    sinks["B"].checkpoint.side_effect = Exception("merge failed")
+    t = _failfast_target(sinks, is_endofpipe=False)
+    with pytest.raises(Exception, match="merge failed"):
+        t.drain_all(is_endofpipe=False)
+    sinks["A"].checkpoint.assert_called_once()  # A already ran (not rolled back)
+    sinks["C"].checkpoint.assert_not_called()  # C never reached
+    t._write_state_message.assert_not_called()
+    assert t._records_since_checkpoint == 42  # not reset
+
+
+def test_endofpipe_clean_up_failure_prevents_final_state():
+    sinks = OrderedDict(A=MagicMock(), B=MagicMock())
+    sinks["B"].clean_up.side_effect = Exception("merge failed")
+    t = _failfast_target(sinks, is_endofpipe=True)
+    with pytest.raises(Exception, match="merge failed"):
         t.drain_all(is_endofpipe=True)
-    # state was still written (good stream A persisted) before raising
-    assert t._written["bookmarks"]["A"] == {"v": 10}
+    sinks["A"].clean_up.assert_called_once()
+    t._write_state_message.assert_not_called()
+
+
+def test_endofpipe_fully_successful_clean_up_writes_final_state():
+    sinks = OrderedDict(A=MagicMock(), B=MagicMock())
+    t = _failfast_target(sinks, is_endofpipe=True)
+    t.drain_all(is_endofpipe=True)
+    for sink in sinks.values():
+        sink.clean_up.assert_called_once()
+    t._write_state_message.assert_called_once_with({"bookmarks": {"A": 10, "B": 20, "C": 30}})
