@@ -1052,3 +1052,29 @@ def test_record_message_increments_counter(monkeypatch):
     t = _counter_target(threshold=1000)
     t._process_record_message({"type": "RECORD", "stream": "A", "record": {}})
     assert t._records_since_checkpoint == 1
+
+
+# --------------------------------------------------------------------------- #
+# drain_all non-endofpipe path checkpoints (MERGE) + resets counter (PQ-3547) #
+# --------------------------------------------------------------------------- #
+def test_drain_all_non_endofpipe_checkpoints_and_resets_counter():
+    from target_bigquery.target import TargetBigQuery
+
+    t = TargetBigQuery.__new__(TargetBigQuery)
+    t._config = {"project": "p", "dataset": "d"}
+    t._latest_state = {"bookmarks": {"A": 5}}
+    sink = MagicMock()
+    t._sinks_active = {"A": sink}
+    t.workers = []
+    t.max_parallelism = 1
+    t._delete_buffer = {}
+    t._records_since_checkpoint = 42
+    t._drain_all = MagicMock()
+    t._raise_pending_worker_error = MagicMock()
+    t._write_state_message = MagicMock()
+    t._reset_max_record_age = MagicMock()
+    t.drain_all(is_endofpipe=False)
+    sink.checkpoint.assert_called_once()  # MERGE ran mid-run
+    sink.clean_up.assert_not_called()  # not a teardown
+    assert t._records_since_checkpoint == 0  # window reset
+    t._write_state_message.assert_called_once()

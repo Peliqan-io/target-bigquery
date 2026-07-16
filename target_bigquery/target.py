@@ -614,7 +614,8 @@ class TargetBigQuery(Target):
                 worker.join()
             self._raise_pending_worker_error()
             for sink in self._sinks_active.values():
-                sink.pre_state_hook()
+                sink.checkpoint()
+            self._records_since_checkpoint = 0
         # Apply buffered DELETERECORDs *before* advancing state, so the bookmark
         # never moves past deletes that were not applied. At end-of-pipe this runs
         # after the clean_up() upserts above (an upsert + delete of the same key in
