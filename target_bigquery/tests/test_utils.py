@@ -1498,3 +1498,190 @@ def test_drain_all_non_endofpipe_eligible_checkpoint_failure_fails_fast():
         t.drain_all(is_endofpipe=False)
     t._write_state_message.assert_not_called()
     assert t._records_since_checkpoint == 42  # not reset
+
+
+# --------------------------------------------------------------------------- #
+# P0 (PQ-3547): a worker/load error must NEVER emit STATE.                     #
+#                                                                             #
+# The old drain_one() error branch recv()'d the worker error (consuming it)   #
+# then called drain_all(is_endofpipe=True). Inside that nested drain,         #
+# _raise_pending_worker_error found the pipe already empty and fell through   #
+# to clean_up() + _write_state_message(), emitting the advanced bookmark      #
+# BEFORE drain_one finally re-raised -> STATE advanced past a failed batch =   #
+# data loss on resume. The fix tears down worker PROCESSES ONLY               #
+# (_shutdown_workers) on the error path and never finalizes sinks or state.   #
+# --------------------------------------------------------------------------- #
+class _FakePipe:
+    """Minimal Connection stand-in. poll() returns queued booleans (then False);
+    recv() returns a fixed payload. Not a MagicMock, so poll()'s truthiness is
+    exactly what we script."""
+
+    def __init__(self, poll_results=(), recv_value=None):
+        self._poll = list(poll_results)
+        self._recv_value = recv_value
+
+    def poll(self):
+        if self._poll:
+            return self._poll.pop(0)
+        return False
+
+    def recv(self):
+        return self._recv_value
+
+
+def test_worker_error_never_emits_state_through_real_drain_path():
+    """The strongest P0 regression: drive the REAL TargetBigQuery.drain_all
+    (is_endofpipe=False) and let the REAL singer-sdk _drain_all() call the REAL
+    drain_one(), whose error poll fires. _drain_all/drain_one are NOT mocked.
+    A worker error must propagate as RuntimeError with workers torn down and
+    ZERO sink finalization / STATE emission -- the previously-emitted bookmark
+    stays the last output."""
+    from target_bigquery.target import TargetBigQuery
+
+    t = TargetBigQuery.__new__(TargetBigQuery)
+    t._config = {"project": "p", "dataset": "d", "fail_fast": True}
+    t._latest_state = {"bookmarks": {"A": 7}}  # already emitted; must not advance
+    t.max_parallelism = 1
+    # logger is a read-only classproperty in the SDK; the real one logs fine.
+    t._delete_buffer = {}
+
+    # Fake pipes: only the error pipe fires (once).
+    t.job_notification = _FakePipe([False])
+    t.log_notification = _FakePipe([False])
+    original_error = RuntimeError("record too large for any AppendRows request")
+    t.error_notification = _FakePipe([True], recv_value=(original_error, "worker load failed"))
+
+    # Fake queue + one alive worker so the real _shutdown_workers has work to do.
+    t.queue = MagicMock()
+    worker = MagicMock()
+    worker.is_alive.return_value = True
+    t.workers = [worker]
+
+    # resize_worker_pool would otherwise spawn a real thread; neutralize only it.
+    t.resize_worker_pool = MagicMock()
+
+    sink = MagicMock()
+    t._sinks_active = {"A": sink}
+
+    # Record-only spies; drain_one() and _drain_all() stay REAL.
+    t._flush_deletes = MagicMock()
+    t._write_state_message = MagicMock()
+    t._reset_max_record_age = MagicMock()
+
+    with pytest.raises(RuntimeError):
+        t.drain_all(is_endofpipe=False)
+
+    # _shutdown_workers ran on the real path: sentinel queued, worker joined, list cleared.
+    t.queue.put.assert_called_once_with(None)
+    worker.join.assert_called_once()
+    assert t.workers == []
+    # Absolutely no sink finalization or STATE emission on the error path.
+    sink.clean_up.assert_not_called()
+    sink.checkpoint.assert_not_called()
+    t._flush_deletes.assert_not_called()
+    t._write_state_message.assert_not_called()
+
+
+# --------------------------------------------------------------------------- #
+# _shutdown_workers(): worker PROCESS teardown only (no sinks/state).          #
+# --------------------------------------------------------------------------- #
+def test_shutdown_workers_sends_sentinels_joins_once_and_clears():
+    from target_bigquery.target import TargetBigQuery
+
+    t = TargetBigQuery.__new__(TargetBigQuery)
+    t.queue = MagicMock()
+    workers = [MagicMock() for _ in range(3)]
+    for w in workers:
+        w.is_alive.return_value = True
+    t.workers = list(workers)
+
+    t._shutdown_workers()
+
+    # One sentinel per alive worker.
+    assert t.queue.put.call_count == 3
+    assert all(c.args == (None,) for c in t.queue.put.call_args_list)
+    # Every worker joined exactly once (no double-join, no skipped first).
+    for w in workers:
+        w.join.assert_called_once()
+    assert t.workers == []
+
+
+def test_shutdown_workers_is_noop_safe_on_empty_list():
+    from target_bigquery.target import TargetBigQuery
+
+    t = TargetBigQuery.__new__(TargetBigQuery)
+    t.queue = MagicMock()
+    t.workers = []
+    t._shutdown_workers()  # must not raise
+    t.queue.put.assert_not_called()
+    assert t.workers == []
+
+
+# --------------------------------------------------------------------------- #
+# P2 (PQ-3547): overwrite exclusion is RUN-LEVEL on the mid-run drain.         #
+# If ANY active sink is in overwrite mode, NO sink is checkpointed -- every    #
+# sink uses pre_state_hook() (origin/master behavior) and STATE is emitted.    #
+# --------------------------------------------------------------------------- #
+def test_drain_all_non_endofpipe_mixed_upsert_and_overwrite_none_checkpoint():
+    upsert = _checkpoint_mock_sink(merge_target=object())
+    overwrite = _checkpoint_mock_sink(overwrite_target=object())
+    t = _drain_target(OrderedDict(A=upsert, B=overwrite), method="batch_job")
+    t.drain_all(is_endofpipe=False)
+    # Run-level gate: coexisting overwrite target excludes the whole run.
+    upsert.checkpoint.assert_not_called()
+    overwrite.checkpoint.assert_not_called()
+    upsert.pre_state_hook.assert_called_once()
+    overwrite.pre_state_hook.assert_called_once()
+    t._write_state_message.assert_called_once()  # STATE still emitted
+
+
+# --------------------------------------------------------------------------- #
+# Batch Job destination resolves self.table.as_ref() per enqueue, so a Job     #
+# enqueued BEFORE a checkpoint carries the generation-1 table and one enqueued #
+# AFTER carries generation-2 (rotated staging table). Uses the __new__-based   #
+# no-BQ sink helper + a recording queue; the MERGE and staging-table creation  #
+# inside checkpoint() are stubbed (no real infra), and rotation is emulated by #
+# swapping self.table -- faithful to how checkpoint() rotates staging.         #
+# --------------------------------------------------------------------------- #
+def test_batch_job_destination_before_and_after_checkpoint_rotation(monkeypatch):
+    from target_bigquery.batch_job import BigQueryBatchJobSink
+    from target_bigquery.core import BigQueryTable, IngestionStrategy, Compressor, ParType
+
+    opts = {
+        "project": "p", "dataset": "d", "jsonschema": {"properties": {}},
+        "transforms": {}, "ingestion_strategy": IngestionStrategy.FIXED,
+    }
+    gen1 = BigQueryTable(name="orders__gen1_1", **opts)
+    gen2 = BigQueryTable(name="orders__gen2_1", **opts)
+
+    s = BigQueryBatchJobSink.__new__(BigQueryBatchJobSink)
+    s.client = MagicMock()
+    s.merge_target = BigQueryTable(name="orders", **opts)
+    s.table = gen1
+    s.buffer = Compressor()
+    s.global_par_typ = ParType.THREAD
+    s.increment_jobs_enqueued = lambda: None
+
+    enqueued = []
+    s.global_queue = MagicMock()
+    s.global_queue.put.side_effect = lambda job: enqueued.append(job)
+
+    # REAL process_batch resolves self.table.as_ref() at enqueue time.
+    s.process_batch({})  # BEFORE checkpoint -> generation 1
+
+    # Stub the destructive halves of checkpoint(): MERGE issues a query; the
+    # staging rotation swaps self.table to generation 2 (no real BQ table).
+    monkeypatch.setattr(
+        type(s), "_merge_staging_into_target", lambda self: self.client.query("MERGE")
+    )
+    monkeypatch.setattr(
+        type(s), "_new_staging_table", lambda self: setattr(self, "table", gen2)
+    )
+    s.checkpoint()
+
+    s.process_batch({})  # AFTER checkpoint -> generation 2
+
+    assert len(enqueued) == 2
+    assert enqueued[0].table == gen1.as_ref()
+    assert enqueued[1].table == gen2.as_ref()
+    assert enqueued[0].table != enqueued[1].table
