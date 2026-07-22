@@ -392,6 +392,13 @@ class TargetBigQuery(Target):
         self._checkpoint_row_threshold = int(self.config.get("checkpoint_row_threshold", 10_000))
         self._records_since_checkpoint = 0
         self._last_schema_stream = None
+        # Track an un-emitted STATE independently of the record counter. A
+        # max-age drain_all() resets _records_since_checkpoint to 0 (emitting the
+        # then-current state); if the tap then emits a table's final STATE with no
+        # new records, the counter stays 0 and the stream-boundary check would
+        # skip that final bookmark. This flag lets the boundary drain fire when a
+        # STATE is pending even though no records have accrued (PQ-3547).
+        self._state_pending = False
 
     def increment_jobs_enqueued(self) -> None:
         """Increment the number of jobs enqueued."""
@@ -608,6 +615,9 @@ class TargetBigQuery(Target):
         checkpoints (only max-age and end-of-pipe still finalize).
         """
         super()._process_state_message(message_dict)
+        # A STATE arrived and may need emitting at the next boundary even if the
+        # record counter is reset by a max-age drain before then (PQ-3547).
+        self._state_pending = True
         if (
             self._checkpoint_row_threshold >= 0
             and self._records_since_checkpoint >= self._checkpoint_row_threshold
@@ -625,14 +635,14 @@ class TargetBigQuery(Target):
         checkpoints WITHIN a single long stream. A re-emitted/evolved schema for
         the SAME stream is not a boundary. Gated the same as the threshold
         trigger (eligible method + a merge sink + no overwrite sink) and only
-        when there is un-checkpointed data, so it is a no-op for out-of-scope
-        methods and adds no empty drains.
+        when there are un-checkpointed records OR a pending un-emitted STATE, so
+        it is a no-op for out-of-scope methods and adds no empty drains.
         """
         stream = message_dict.get("stream")
         if (
             self._last_schema_stream is not None
             and stream != self._last_schema_stream
-            and self._records_since_checkpoint > 0
+            and (self._records_since_checkpoint > 0 or self._state_pending)
             and self._row_threshold_checkpoint_eligible()
         ):
             self.drain_all(is_endofpipe=False)
@@ -756,6 +766,9 @@ class TargetBigQuery(Target):
             self._flush_deletes()
         if state:
             self._write_state_message(state)
+            # The pending STATE has now been emitted; clear the flag so a later
+            # stream boundary does not force a redundant empty drain (PQ-3547).
+            self._state_pending = False
         self._reset_max_record_age()
 
     def _raise_pending_worker_error(self) -> None:

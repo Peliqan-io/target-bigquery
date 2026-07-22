@@ -1146,6 +1146,7 @@ def _counter_target(threshold, method="batch_job", sinks_active=None):
         "method": method,
     }
     t._records_since_checkpoint = 0
+    t._state_pending = False
     t._checkpoint_row_threshold = threshold
     t._latest_state = {"bookmarks": {}}
     # Default: one eligible (upserting) sink, so threshold tests exercise only
@@ -1377,6 +1378,98 @@ def test_first_schema_of_run_does_not_checkpoint(monkeypatch):
     )
     t.drain_all.assert_not_called()
     assert t._last_schema_stream == "A"
+
+
+# --------------------------------------------------------------------------- #
+# SCHEMA-boundary checkpoint on a PENDING STATE after a max-age counter reset  #
+# (PQ-3547): a singer-sdk max-age drain calls drain_all(is_endofpipe=False),   #
+# which resets _records_since_checkpoint to 0 and emits the then-current       #
+# (pre-final) state. If the tap then emits the table's FINAL STATE (no new     #
+# records), the counter stays 0 but a bookmark is pending; the stream boundary #
+# must still drain it rather than stranding it to EOF/next max-age.            #
+# --------------------------------------------------------------------------- #
+def test_schema_boundary_drains_pending_state_after_maxage_reset(monkeypatch):
+    """Counter already reset to 0 by a preceding max-age drain, then table A's
+    final STATE arrives (updates _latest_state, adds no records) so
+    _state_pending is True. A SCHEMA for a new stream B is a genuine boundary;
+    the pending final bookmark must drain here even though the counter is 0."""
+    import target_bigquery.target as tgt
+
+    assert tgt.TargetBigQuery.__mro__[1].__name__ == "Target"
+    monkeypatch.setattr(
+        tgt.TargetBigQuery.__mro__[1], "_process_schema_message", lambda self, m: None
+    )
+    t = _counter_target(threshold=10_000)
+    t._row_threshold_checkpoint_eligible = MagicMock(return_value=True)
+    t._last_schema_stream = "A"
+    t._records_since_checkpoint = 0  # reset by the preceding max-age drain
+    t._state_pending = True  # A's final STATE arrived, not yet emitted
+    t._process_schema_message(
+        {"stream": "B", "schema": {"properties": {}}, "key_properties": ["id"]}
+    )
+    t.drain_all.assert_called_once_with(is_endofpipe=False)
+    assert t._last_schema_stream == "B"  # boundary advanced
+
+
+def test_schema_boundary_no_drain_when_no_records_and_no_pending_state(monkeypatch):
+    """Genuine boundary but nothing to emit: counter 0 AND no pending STATE ->
+    no redundant empty drain (preserves the no-empty-drains intent)."""
+    import target_bigquery.target as tgt
+
+    monkeypatch.setattr(
+        tgt.TargetBigQuery.__mro__[1], "_process_schema_message", lambda self, m: None
+    )
+    t = _counter_target(threshold=10_000)
+    t._row_threshold_checkpoint_eligible = MagicMock(return_value=True)
+    t._last_schema_stream = "A"
+    t._records_since_checkpoint = 0
+    t._state_pending = False
+    t._process_schema_message(
+        {"stream": "B", "schema": {"properties": {}}, "key_properties": ["id"]}
+    )
+    t.drain_all.assert_not_called()
+    assert t._last_schema_stream == "B"
+
+
+def test_state_message_marks_state_pending(monkeypatch):
+    """A STATE message marks state as pending so a later stream boundary can
+    emit it even after a max-age drain resets the record counter. Uses a high
+    threshold so only the flag is set (no threshold-trigger drain here)."""
+    import target_bigquery.target as tgt
+
+    monkeypatch.setattr(
+        tgt.TargetBigQuery.__mro__[1], "_process_state_message", lambda self, m: None
+    )
+    t = _counter_target(threshold=1000)
+    t._records_since_checkpoint = 0
+    t._state_pending = False
+    t._process_state_message({"type": "STATE", "value": {"bookmarks": {"A": 1}}})
+    assert t._state_pending is True
+    t.drain_all.assert_not_called()  # threshold not met; only the flag was set
+
+
+def test_drain_all_clears_state_pending_after_writing_state():
+    """Once drain_all emits the pending STATE via _write_state_message, the flag
+    clears so a subsequent boundary does not force a redundant empty drain."""
+    from target_bigquery.target import TargetBigQuery
+
+    t = TargetBigQuery.__new__(TargetBigQuery)
+    t._config = {"project": "p", "dataset": "d"}
+    t._latest_state = {"bookmarks": {"A": 5}}
+    sink = _checkpoint_mock_sink(merge_target=object())  # eligible: upsert sink
+    t._sinks_active = {"A": sink}
+    t.workers = []
+    t.max_parallelism = 1
+    t._delete_buffer = {}
+    t._records_since_checkpoint = 0
+    t._state_pending = True
+    t._drain_all = MagicMock()
+    t._raise_pending_worker_error = MagicMock()
+    t._write_state_message = MagicMock()
+    t._reset_max_record_age = MagicMock()
+    t.drain_all(is_endofpipe=False)
+    t._write_state_message.assert_called_once()
+    assert t._state_pending is False
 
 
 # --------------------------------------------------------------------------- #
