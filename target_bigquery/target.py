@@ -690,8 +690,15 @@ class TargetBigQuery(Target):
             for sink in self._sinks_active.values():
                 sink.clean_up()
         else:
-            for worker in self.workers:
-                worker.join()
+            # Mid-run drain (row-threshold / max-age checkpoint). Tear down
+            # worker processes via the shared helper, which enqueues a None
+            # sentinel per alive worker so each exits its blocking
+            # queue.get(timeout=30.0) immediately -- a bare join() here would
+            # block ~30s per worker until that Empty timeout elapsed, wasting
+            # tens of minutes over a data-heavy stream that checkpoints often
+            # (PQ-3547). It also clears self.workers, so resize_worker_pool()
+            # in drain_one() re-grows the pool on the next records.
+            self._shutdown_workers()
             self._raise_pending_worker_error()
             # Run-level overwrite exclusion (PQ-3547 §5.3/§10, P2). This branch
             # also runs on the singer-sdk max-age timer (_handle_max_record_age

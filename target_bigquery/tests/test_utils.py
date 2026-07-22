@@ -1618,6 +1618,50 @@ def test_shutdown_workers_is_noop_safe_on_empty_list():
 
 
 # --------------------------------------------------------------------------- #
+# mid-run drain must STOP workers (sentinel) before joining (PQ-3547).         #
+#                                                                             #
+# drain_all(is_endofpipe=False) is the row-threshold / max-age checkpoint path #
+# and runs frequently (every ~batch on a data-heavy stream). The old branch    #
+# did a bare `for worker in self.workers: worker.join()` with NO stop sentinel #
+# and never cleared self.workers -- each BatchJobWorker/storage_write worker    #
+# only exits after its blocking queue.get(timeout=30.0) raises Empty, so every  #
+# checkpoint stalled ~30s per live worker (tens of minutes over a big stream).  #
+# The fix routes this branch through _shutdown_workers(), which enqueues a None #
+# sentinel per alive worker (immediate exit), joins, and clears the pool so     #
+# resize_worker_pool() re-grows it on the next records.                         #
+# --------------------------------------------------------------------------- #
+def test_drain_all_non_endofpipe_sends_stop_sentinels_before_join():
+    from target_bigquery.target import TargetBigQuery
+
+    t = TargetBigQuery.__new__(TargetBigQuery)
+    t._config = {"project": "p", "dataset": "d"}
+    t._latest_state = {"bookmarks": {"A": 5}}
+    sink = _checkpoint_mock_sink(merge_target=object())  # eligible upsert sink
+    t._sinks_active = {"A": sink}
+    t.queue = MagicMock()
+    worker = MagicMock()
+    worker.is_alive.return_value = True
+    t.workers = [worker]
+    t.max_parallelism = 1
+    t._delete_buffer = {}
+    t._records_since_checkpoint = 42
+    t._drain_all = MagicMock()
+    t._raise_pending_worker_error = MagicMock()
+    t._write_state_message = MagicMock()
+    t._reset_max_record_age = MagicMock()
+
+    t.drain_all(is_endofpipe=False)
+
+    # A stop sentinel (None) was enqueued once per alive worker, so each worker
+    # breaks out of queue.get(timeout=30.0) immediately instead of blocking ~30s
+    # for Empty. Pre-fix (bare join loop) put NO sentinel -> this assertion fails.
+    t.queue.put.assert_called_once_with(None)
+    worker.join.assert_called_once()
+    # Pool cleared so resize_worker_pool() re-grows it on the next records.
+    assert t.workers == []
+
+
+# --------------------------------------------------------------------------- #
 # P2 (PQ-3547): overwrite exclusion is RUN-LEVEL on the mid-run drain.         #
 # If ANY active sink is in overwrite mode, NO sink is checkpointed -- every    #
 # sink uses pre_state_hook() (origin/master behavior) and STATE is emitted.    #
