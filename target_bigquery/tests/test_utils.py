@@ -1729,3 +1729,58 @@ def test_batch_job_destination_before_and_after_checkpoint_rotation(monkeypatch)
     assert enqueued[0].table == gen1.as_ref()
     assert enqueued[1].table == gen2.as_ref()
     assert enqueued[0].table != enqueued[1].table
+
+
+# --------------------------------------------------------------------------- #
+# commit_streams(): a partial batch-commit failure must ABORT the checkpoint   #
+# (PQ-3547). batch_commit_write_streams() reports per-stream commit failures   #
+# in response.stream_errors. commit_streams() runs BEFORE the MERGE in         #
+# checkpoint()/clean_up()/pre_state_hook(); if it only logs those errors and   #
+# returns, the caller proceeds to MERGE and emits STATE -> the bookmark        #
+# advances past data that was never committed = silent loss. It must RAISE.    #
+# (Only the batch_mode/application-stream path is hardened; the `_default`     #
+# path filters open_streams to empty and never calls batch_commit_write_streams.)#
+# --------------------------------------------------------------------------- #
+def _commit_streams_sink(stream_errors):
+    """A storage_write sink (no __init__/BQ) whose stubbed committer returns a
+    batch_commit_write_streams response with the given `stream_errors`, and one
+    open application (non-`_default`) stream ready to commit."""
+    from target_bigquery.storage_write import BigQueryStorageWriteDenormalizedSink as SW
+
+    s = SW.__new__(SW)
+    s.logger = MagicMock()  # set in Sink.__init__ (bypassed by __new__)
+    s._credentials = MagicMock()
+    s.parent = "projects/p/datasets/d/tables/salesinvoicelines__gen1_1"
+    # No pending stream payloads to drain: poll() returns False immediately.
+    s.stream_notification = _FakePipe([False])
+    stream = MagicMock()  # an application stream; stream.close() must be called
+    s.open_streams = {("app_write_stream", stream)}
+
+    committer = MagicMock()
+    response = MagicMock()
+    response.stream_errors = stream_errors
+    committer.batch_commit_write_streams.return_value = response
+    return s, committer, stream
+
+
+def test_commit_streams_raises_on_batch_commit_stream_errors():
+    s, committer, stream = _commit_streams_sink(stream_errors=["stream commit failed"])
+    with patch(
+        "target_bigquery.storage_write.storage_client_factory", return_value=committer
+    ):
+        with pytest.raises(RuntimeError):
+            s.commit_streams()
+    # The stream was finalized/closed and a commit was attempted before the raise.
+    stream.close.assert_called_once()
+    committer.finalize_write_stream.assert_called_once()
+    committer.batch_commit_write_streams.assert_called_once()
+
+
+def test_commit_streams_does_not_raise_when_no_stream_errors():
+    s, committer, stream = _commit_streams_sink(stream_errors=[])
+    with patch(
+        "target_bigquery.storage_write.storage_client_factory", return_value=committer
+    ):
+        s.commit_streams()  # clean commit -> must not raise
+    committer.batch_commit_write_streams.assert_called_once()
+    assert s.open_streams == set()  # reset after a successful commit

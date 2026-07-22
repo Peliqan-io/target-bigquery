@@ -747,7 +747,11 @@ class BigQueryStorageWriteSink(BaseBigQuerySink):
                 )
             )
             self.logger.info(f"Batch commit time: {write.commit_time}")
-            self.logger.info(f"Batch commit errors: {write.stream_errors}")
+            if write.stream_errors:
+                self.logger.error(f"Storage Write batch commit failed: {write.stream_errors}")
+                raise RuntimeError(
+                    f"Storage Write batch_commit_write_streams reported stream errors: {write.stream_errors}"
+                )
             self.logger.info(f"Writes to streams: '{self.open_streams}' have been committed.")
         self.open_streams = set()
 
