@@ -391,6 +391,7 @@ class TargetBigQuery(Target):
         # threshold triggers a non-endofpipe drain_all() (MERGE + emit state).
         self._checkpoint_row_threshold = int(self.config.get("checkpoint_row_threshold", 10_000))
         self._records_since_checkpoint = 0
+        self._last_schema_stream = None
 
     def increment_jobs_enqueued(self) -> None:
         """Increment the number of jobs enqueued."""
@@ -613,6 +614,30 @@ class TargetBigQuery(Target):
             and self._row_threshold_checkpoint_eligible()
         ):
             self.drain_all(is_endofpipe=False)
+
+    def _process_schema_message(self, message_dict: dict) -> None:
+        """Checkpoint the completed previous table at a genuine stream boundary.
+
+        A SCHEMA for a DIFFERENT stream means the previous table is done. We
+        checkpoint it here regardless of the row threshold, so even a small
+        table (below checkpoint_row_threshold) gets its bookmark persisted per
+        PQ-3547 "bookmark after each table". The threshold still coalesces
+        checkpoints WITHIN a single long stream. A re-emitted/evolved schema for
+        the SAME stream is not a boundary. Gated the same as the threshold
+        trigger (eligible method + a merge sink + no overwrite sink) and only
+        when there is un-checkpointed data, so it is a no-op for out-of-scope
+        methods and adds no empty drains.
+        """
+        stream = message_dict.get("stream")
+        if (
+            self._last_schema_stream is not None
+            and stream != self._last_schema_stream
+            and self._records_since_checkpoint > 0
+            and self._row_threshold_checkpoint_eligible()
+        ):
+            self.drain_all(is_endofpipe=False)
+        self._last_schema_stream = stream
+        super()._process_schema_message(message_dict)
 
     def _shutdown_workers(self) -> None:
         """Tear down the worker PROCESSES only -- never touches sinks or state.

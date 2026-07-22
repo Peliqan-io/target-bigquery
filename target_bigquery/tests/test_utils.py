@@ -1291,6 +1291,95 @@ def test_no_row_threshold_checkpoint_when_no_sink_is_upserting(monkeypatch, meth
 
 
 # --------------------------------------------------------------------------- #
+# SCHEMA-message table-boundary checkpoint (PQ-3547 "bookmark after each       #
+# table"): a SCHEMA for a NEW stream means the previous table is done, so it   #
+# is checkpointed regardless of the row threshold -- even a small table below  #
+# checkpoint_row_threshold gets its bookmark persisted. A same-stream re-emit  #
+# is not a boundary, and a boundary with no un-checkpointed data adds no drain.#
+# --------------------------------------------------------------------------- #
+def test_schema_boundary_checkpoints_small_completed_table(monkeypatch):
+    """Table A completes with only ~100 records (well below the 10_000 default
+    threshold); a SCHEMA for a different stream B is a genuine table boundary,
+    so A is checkpointed via drain_all(is_endofpipe=False) anyway."""
+    import target_bigquery.target as tgt
+
+    # Target (TargetBigQuery.__mro__[1]) defines the SDK base
+    # _process_schema_message (which only registers the schema, never drains);
+    # patch it so the test needs no real mapper and our override's own boundary
+    # logic is what's under test.
+    assert tgt.TargetBigQuery.__mro__[1].__name__ == "Target"
+    monkeypatch.setattr(
+        tgt.TargetBigQuery.__mro__[1], "_process_schema_message", lambda self, m: None
+    )
+    t = _counter_target(threshold=10_000)
+    t._row_threshold_checkpoint_eligible = MagicMock(return_value=True)
+    t._last_schema_stream = "A"
+    t._records_since_checkpoint = 100  # small table, far below threshold
+    t._process_schema_message(
+        {"stream": "B", "schema": {"properties": {}}, "key_properties": []}
+    )
+    t.drain_all.assert_called_once_with(is_endofpipe=False)
+    assert t._last_schema_stream == "B"  # boundary advanced
+
+
+def test_schema_reemit_same_stream_does_not_checkpoint(monkeypatch):
+    """A re-emitted/evolved SCHEMA for the SAME stream is not a table boundary,
+    so it must not trigger a checkpoint drain."""
+    import target_bigquery.target as tgt
+
+    monkeypatch.setattr(
+        tgt.TargetBigQuery.__mro__[1], "_process_schema_message", lambda self, m: None
+    )
+    t = _counter_target(threshold=10_000)
+    t._row_threshold_checkpoint_eligible = MagicMock(return_value=True)
+    t._last_schema_stream = "A"
+    t._records_since_checkpoint = 100
+    t._process_schema_message(
+        {"stream": "A", "schema": {"properties": {}}, "key_properties": []}
+    )
+    t.drain_all.assert_not_called()
+    assert t._last_schema_stream == "A"
+
+
+def test_schema_boundary_no_checkpoint_when_no_records(monkeypatch):
+    """A genuine boundary but with nothing un-checkpointed
+    (_records_since_checkpoint == 0) is a no-op: no empty drain is added."""
+    import target_bigquery.target as tgt
+
+    monkeypatch.setattr(
+        tgt.TargetBigQuery.__mro__[1], "_process_schema_message", lambda self, m: None
+    )
+    t = _counter_target(threshold=10_000)
+    t._row_threshold_checkpoint_eligible = MagicMock(return_value=True)
+    t._last_schema_stream = "A"
+    t._records_since_checkpoint = 0
+    t._process_schema_message(
+        {"stream": "B", "schema": {"properties": {}}, "key_properties": []}
+    )
+    t.drain_all.assert_not_called()
+    assert t._last_schema_stream == "B"
+
+
+def test_first_schema_of_run_does_not_checkpoint(monkeypatch):
+    """The very first SCHEMA of a run (no previous table,
+    _last_schema_stream is None) sets the tracked stream but must not drain."""
+    import target_bigquery.target as tgt
+
+    monkeypatch.setattr(
+        tgt.TargetBigQuery.__mro__[1], "_process_schema_message", lambda self, m: None
+    )
+    t = _counter_target(threshold=10_000)
+    t._row_threshold_checkpoint_eligible = MagicMock(return_value=True)
+    t._last_schema_stream = None
+    t._records_since_checkpoint = 5
+    t._process_schema_message(
+        {"stream": "A", "schema": {"properties": {}}, "key_properties": []}
+    )
+    t.drain_all.assert_not_called()
+    assert t._last_schema_stream == "A"
+
+
+# --------------------------------------------------------------------------- #
 # drain_all non-endofpipe path checkpoints (MERGE) + resets counter (PQ-3547) #
 # --------------------------------------------------------------------------- #
 def _checkpoint_mock_sink(merge_target=None, overwrite_target=None):
