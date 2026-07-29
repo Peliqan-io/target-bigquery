@@ -769,15 +769,17 @@ class BigQueryStorageWriteSink(BaseBigQuerySink):
         # streams (no-op for _default) and await oversized-row fallback Load
         # Jobs, so every staged row is in the temp before we merge. Mirrors
         # clean_up() above, but for the non-terminal, repeatable checkpoint.
+        # super().checkpoint() closes the staging generation without creating
+        # a successor; parent/template are recomputed in _on_staging_rotated()
+        # when the next batch lazily reopens one (PQ-3547 C1).
         self.commit_streams()
         self._wait_for_fallback_jobs()
         super().checkpoint()
-        # super().checkpoint() rotated self.table to a fresh staging table
-        # (PQ-3547 C1) — if it raised, we don't get here, and no rotation
-        # happened, so the old parent/template are still correct and must be
-        # left alone. On success, recompute parent/template from the NEW
-        # self.table so the next queued Job (and any post-rotation stream
-        # open) targets generation N+1, never the just-dropped generation N.
+
+    def _on_staging_rotated(self) -> None:
+        # ensure_staging() pointed self.table at a fresh staging generation;
+        # recompute parent/template so every subsequent Job (and any stream
+        # open) targets the new generation, never a dropped one (PQ-3547 C1).
         self._refresh_write_destination()
 
 

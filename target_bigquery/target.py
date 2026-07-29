@@ -697,6 +697,12 @@ class TargetBigQuery(Target):
                 except Exception:
                     self.logger.error("Worker shutdown after error failed.")
                 raise RuntimeError(msg) from e
+        # Lazy staging generation (PQ-3547): a merge sink whose generation was
+        # closed by a previous checkpoint gets a fresh staging table here,
+        # immediately before its buffered records are turned into jobs. Gated
+        # on current_size so empty drains never create a table.
+        if sink.current_size:
+            sink.ensure_staging()
         super().drain_one(sink)
 
     def drain_all(self, is_endofpipe: bool = False) -> None:  # type: ignore

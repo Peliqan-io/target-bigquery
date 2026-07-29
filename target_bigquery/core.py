@@ -327,14 +327,21 @@ class BaseBigQuerySink(BatchSink):
         # In absence of dedupe or overwrite candidacy, we append to the target table directly
         # If the stream is marked for one of these strategies, we create a temporary table instead
         # and merge or overwrite the target table with the temporary table after the ingest.
+        self._staging_open = False
         if (
             key_properties
             and self.ingestion_strategy is IngestionStrategy.DENORMALIZED
             and self._is_upsert_candidate()
         ):
+            # Lazy staging generation (PQ-3547): no staging table is created
+            # here. ensure_staging() opens one right before the first batch is
+            # enqueued, and checkpoint() closes it (MERGE + DROP) without
+            # creating a successor -- so no staging table ever exists without
+            # data destined for it, and none is left orphaned at end-of-pipe.
             self.merge_target = copy(self.table)
-            self._new_staging_table()
         elif self._is_overwrite_candidate():
+            # Overwrite stays eager: an empty run must still replace the
+            # target with an empty table at clean_up().
             self.overwrite_target = copy(self.table)
             self._new_staging_table()
 
@@ -543,23 +550,45 @@ class BaseBigQuerySink(BatchSink):
         )
         self.client.query(merge_sql).result()
 
+    def ensure_staging(self) -> None:
+        """Open a staging generation if none is open, right before a batch is
+        enqueued. No-op for non-merge sinks and when a generation is already
+        open. Called from the target's drain path for sinks with buffered
+        records -- the single choke point through which every job reaches a
+        worker, so a job can never target a closed (dropped) generation."""
+        if self.merge_target is None or self._staging_open:
+            return
+        self._new_staging_table()
+        self._staging_open = True
+        self._on_staging_rotated()
+
+    def _on_staging_rotated(self) -> None:
+        """Hook for sinks whose write destination is derived from self.table
+        (storage_write parent/template). Called after ensure_staging() points
+        self.table at a freshly created staging generation."""
+        pass
+
     def checkpoint(self) -> None:
-        """Mid-run: MERGE staged rows into the real table and rotate a fresh
-        temp. Repeatable and non-destructive (merge_target is preserved).
-        No-op unless this is a merge/upsert stream. Callers must have run the
-        per-method durability barrier first (workers joined, appends resolved,
-        fallback jobs awaited)."""
-        if self.merge_target is None:
+        """Mid-run: MERGE the open staging generation into the real table and
+        close it (the MERGE SQL drops the staging table). No successor is
+        created -- the next batch with actual records reopens one lazily via
+        ensure_staging(). No-op when nothing is staged, so finished streams
+        cost nothing on later drains. Callers must have run the per-method
+        durability barrier first (workers joined, appends resolved, fallback
+        jobs awaited)."""
+        if self.merge_target is None or not self._staging_open:
             return
         self._merge_staging_into_target()
-        self._new_staging_table()
+        self._staging_open = False
 
     def clean_up(self) -> None:
         """Finalize at end-of-pipe: MERGE (or overwrite) staging into target,
         then tear down. Unlike checkpoint(), this is the terminal step."""
         if self.merge_target is not None:
-            # We must merge the temp table into the target table.
-            self._merge_staging_into_target()
+            if self._staging_open:
+                # We must merge the temp table into the target table.
+                self._merge_staging_into_target()
+                self._staging_open = False
             self.table = self.merge_target
             self.merge_target = None
         elif self.overwrite_target is not None:
