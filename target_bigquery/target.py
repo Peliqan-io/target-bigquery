@@ -751,11 +751,15 @@ class TargetBigQuery(Target):
                 getattr(sink, "overwrite_target", None) is not None
                 for sink in self._sinks_active.values()
             )
-            for sink in self._sinks_active.values():
+            checkpointed = []
+            for sink in list(self._sinks_active.values()):
                 if not has_overwrite and self._sink_checkpoint_eligible(sink):
                     sink.checkpoint()
+                    checkpointed.append(sink.stream_name)
                 else:
                     sink.pre_state_hook()
+            for name in checkpointed:
+                self._sinks_active.pop(name, None)
             self._records_since_checkpoint = 0
         # Apply buffered DELETERECORDs *before* advancing state, so the bookmark
         # never moves past deletes that were not applied. At end-of-pipe this runs
