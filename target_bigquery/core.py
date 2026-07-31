@@ -369,6 +369,9 @@ class BaseBigQuerySink(BatchSink):
         self.global_par_typ = target.par_typ
         self.global_queue = target.queue
         self.increment_jobs_enqueued = target.increment_jobs_enqueued
+        # Pump used from the enqueue backpressure loop so a stalled queue can
+        # still respawn workers and fail fast on a reported error (PQ-3820).
+        self._pump_backpressure = target._pump_backpressure
 
     def _is_upsert_candidate(self) -> bool:
         """Determine if this stream is an upsert candidate based on user configuration."""
