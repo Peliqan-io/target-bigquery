@@ -23,7 +23,7 @@ from target_bigquery.storage_write import (
     Job,
     StorageWriteBatchWorker,
 )
-from test_review_findings import FakePipe, FakeQueue, FakeStream, make_worker
+from test_review_findings import FakePipe, FakeQueue, FakeStream, fake_client, make_worker
 
 PARENT = "projects/p/datasets/d/tables/t"
 DEFAULT_PATH = PARENT + "/streams/_default"
@@ -76,7 +76,7 @@ def test_worker_does_not_open_stream_for_empty_job(monkeypatch):
               data=types.ProtoRows())            # zero rows
     worker = make_worker(FakeQueue([job]), {})   # empty cache: open path armed
     worker.get_stream_components = lambda client, j: (
-        opened.append(j.parent) or (DEFAULT_PATH, FakeStream(), lambda r: None)
+        opened.append(j.parent) or (DEFAULT_PATH, FakeStream(), lambda r: None, client)
     )
 
     worker.run()
@@ -112,8 +112,8 @@ def test_close_cached_streams_tolerates_already_closed():
     worker.logger = sw.logger
     worker.error_notifier = FakePipe()
     worker.cache = {
-        "a": ("path-a", ClosedStream(), None),   # cosmetic — must be swallowed
-        "b": ("path-b", BrokenStream(), None),   # real — must be reported
+        "a": ("path-a", ClosedStream(), None, fake_client()),   # cosmetic — must be swallowed
+        "b": ("path-b", BrokenStream(), None, fake_client()),   # real — must be reported
     }
 
     worker.close_cached_streams()

@@ -14,6 +14,7 @@ from queue import Empty
 from types import SimpleNamespace
 
 import pytest
+from google.api_core.exceptions import NotFound
 from google.cloud.bigquery_storage_v1 import types
 
 import target_bigquery.storage_write as sw
@@ -48,6 +49,12 @@ class FakeStream:
 
     def close(self):
         self._closed = True
+
+
+def fake_client():
+    """Stand-in gRPC write client; transport.close() is a no-op. Cache entries
+    are now (name, stream, dispatch, client) 4-tuples (PQ-3820)."""
+    return SimpleNamespace(transport=SimpleNamespace(close=lambda: None))
 
 
 class FakeQueue:
@@ -123,7 +130,7 @@ def test_partially_dispatched_job_does_not_resend_completed_chunks():
               stream_notifier=FakePipe(),
               data=make_rows(b"A" * 60, b"B" * 60, b"C" * 60))  # 3 chunks
     queue = FakeQueue([job])
-    worker = make_worker(queue, {PARENT: (DEFAULT_PATH, FakeStream(), dispatch)})
+    worker = make_worker(queue, {PARENT: (DEFAULT_PATH, FakeStream(), dispatch, fake_client())})
 
     worker.run()
 
@@ -153,6 +160,7 @@ def test_stream_creation_failure_reports_instead_of_killing_worker(monkeypatch):
     def failing_components(client, job):
         raise RuntimeError("create_write_stream: 503 unavailable")
 
+    worker._assert_target_table_exists = lambda parent: None  # bypass PQ-3820 preflight
     worker.get_stream_components = failing_components
 
     worker.run()  # must NOT raise (currently the exception escapes = dead worker)
@@ -185,3 +193,31 @@ def test_fallback_job_config_applies_column_transforms():
         "fallback Load Job uses the untransformed schema while its rows carry "
         "transformed keys -> columns silently dropped (ignore_unknown_values)"
     )
+
+
+# --------------------------------------------------------------------------- #
+# PQ-3820 — a deleted target table aborts fast instead of looping/leaking
+# --------------------------------------------------------------------------- #
+
+def test_deleted_table_aborts_instead_of_looping():
+    """The default-stream bidi open() hangs (no NotFound) on a deleted table and
+    leaks a consumer thread per attempt. The get_table() preflight surfaces
+    NotFound; after PERMANENT_ERROR_TOLERANCE attempts the worker reports it and
+    raises (aborts) rather than reopening forever (PQ-3820)."""
+    job = Job(parent=PARENT,
+              template=SimpleNamespace(write_stream=DEFAULT_PATH),
+              stream_notifier=FakePipe(),
+              data=make_rows(b"A" * 60))
+    worker = make_worker(FakeQueue([job]), {})  # empty cache -> reopen path -> preflight
+
+    def gone(parent):
+        raise NotFound("404 Not found: Table t")
+
+    worker._assert_target_table_exists = gone
+
+    with pytest.raises(NotFound):
+        worker.run()
+
+    # reported the permanent error exactly once and stopped (did not loop)
+    assert len(worker.error_notifier.sent) == 1
+    assert isinstance(worker.error_notifier.sent[0][0], NotFound)

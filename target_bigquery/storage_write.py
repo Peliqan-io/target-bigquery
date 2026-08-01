@@ -39,6 +39,11 @@ import orjson, decimal
 from google.cloud import bigquery
 from google.cloud.bigquery_storage_v1 import BigQueryWriteClient, types, writer
 from google.cloud.bigquery_storage_v1 import exceptions as bqstorage_exceptions
+from google.api_core.exceptions import (
+    NotFound,
+    PermissionDenied,
+    Forbidden,
+)
 from google.protobuf import json_format
 from proto import Message
 from tenacity import retry, stop_after_attempt, wait_fixed
@@ -94,6 +99,16 @@ via `options.max_request_bytes`."""
 PER_ROW_OVERHEAD = 8
 """Conservative per-row proto framing cost inside ProtoRows (tag byte + length varint)."""
 
+# PQ-3820: deterministic target-side failures. Retrying or recycling can never
+# succeed (table/dataset deleted, permission revoked, schema mismatch), so we
+# treat these as fatal — report once and stop — instead of looping the
+# recycle -> respawn -> fresh-channel path forever and leaking gRPC channels.
+PERMANENT_ERRORS = (NotFound, PermissionDenied, Forbidden)
+PERMANENT_ERROR_TOLERANCE = 2
+"""Attempts to tolerate a permanent-looking error before aborting — covers the
+brief post-create_table eventual-consistency window before declaring the target
+genuinely gone."""
+
 
 class RecordTooLargeError(ValueError):
     """A single serialized row exceeds the AppendRows request budget.
@@ -127,7 +142,10 @@ def chunk_proto_rows(rows: types.ProtoRows, limit: int = MAX_REQUEST_BYTES):
         yield chunk
 
 Dispatcher = Callable[[types.AppendRowsRequest], writer.AppendRowsFuture]
-StreamComponents = Tuple[str, writer.AppendRowsStream, Dispatcher]
+# 4th element (client) retained so the gRPC channel can be closed when the
+# stream is superseded/recycled — otherwise the channel + its polling thread
+# leak on every reopen (PQ-3820).
+StreamComponents = Tuple[str, writer.AppendRowsStream, Dispatcher, BigQueryWriteClient]
 
 STREAM_OPEN_TIMEOUT = 90.0
 """How long to wait for the bidi AppendRows stream to open before failing.
@@ -149,6 +167,20 @@ def fresh_storage_client(credentials) -> BigQueryWriteClient:
     2026-07-09). Opens are rare (once per table per worker + recycles), so an
     uncached client here is cheap."""
     return storage_client_factory.__wrapped__(credentials)
+
+
+def _close_client(client: BigQueryWriteClient) -> None:
+    """Best-effort close of a client's gRPC channel (and its polling thread).
+
+    Closing an AppendRowsStream does NOT close the underlying client channel;
+    a worker that reopens streams many times therefore accumulates channels and
+    their background threads unbounded (PQ-3820) — the leak that pegged whole
+    nodes on long Silverfin/Exact -> BigQuery syncs. Call this whenever a client
+    is superseded on reopen or the worker shuts down."""
+    try:
+        client.transport.close()
+    except Exception:
+        pass
 
 
 class BoundedOpenAppendRowsStream(writer.AppendRowsStream):
@@ -193,7 +225,7 @@ def get_application_stream(client: BigQueryWriteClient, job: "Job") -> StreamCom
         wait=wait_fixed(2),
         stop=stop_after_attempt(5),
         reraise=True,
-    )
+    ), client  # keep client so its channel can be closed on recycle (PQ-3820)
 
 
 def get_default_stream(client: BigQueryWriteClient, job: "Job") -> StreamComponents:
@@ -209,7 +241,7 @@ def get_default_stream(client: BigQueryWriteClient, job: "Job") -> StreamCompone
         wait=wait_fixed(2),
         stop=stop_after_attempt(5),
         reraise=True,
-    )
+    ), client  # keep client so its channel can be closed on recycle (PQ-3820)
 
 
 def generate_request(
@@ -369,12 +401,17 @@ class StorageWriteBatchWorker(BaseWorker):
                     # channel. Opening a second bidi stream on a channel that already
                     # carried one intermittently stalls inside _open() (the issue #71
                     # hang with nested RECORD schemas); a fresh channel opens reliably.
-                    # Stream opens are rare (once per table per worker + recycles), so
-                    # the extra client is cheap.
+                    # Close the superseded client first so its gRPC channel (and its
+                    # background polling thread) don't leak across reopens (PQ-3820).
+                    # Fast-fail on a deleted table BEFORE opening: the default-stream
+                    # bidi open() otherwise hangs (no NotFound) and leaks a consumer
+                    # thread per attempt.
+                    self._assert_target_table_exists(job.parent)
+                    self._close_cached_client(job.parent)
                     client: BigQueryWriteClient = fresh_storage_client(self.credentials)
                     self.cache[job.parent] = self.get_stream_components(client, job)
                     self.offsets[job.parent] = 0
-                write_stream, _, dispatch = cast(StreamComponents, self.cache[job.parent])
+                write_stream, _, dispatch, _ = cast(StreamComponents, self.cache[job.parent])
 
                 kwargs = {"offset": None, "path": None}
                 if write_stream.endswith("_default"):
@@ -412,6 +449,28 @@ class StorageWriteBatchWorker(BaseWorker):
                 self.logger.error(f"[{self.ext_id}] {exc}")
                 self.error_notifier.send((exc, self.serialize_exception(exc)))
                 self.job_notifier.send(True)
+            except PERMANENT_ERRORS as exc:
+                # Deterministic target failure (table/dataset deleted, permission
+                # revoked, schema mismatch). Retrying/recycling can never succeed
+                # and loops forever leaking channels (PQ-3820). Tolerate a couple
+                # of attempts for post-create eventual consistency, then abort so
+                # the sync fails fast to ERROR instead of respawning endlessly.
+                job.attempts += 1
+                if job.attempts <= PERMANENT_ERROR_TOLERANCE:
+                    self.logger.warning(
+                        f"[{self.ext_id}] permanent-looking error on {job.parent} "
+                        f"(attempt {job.attempts}/{PERMANENT_ERROR_TOLERANCE}): {exc!r}"
+                    )
+                    self.queue.put(job)
+                else:
+                    self.logger.error(
+                        f"[{self.ext_id}] permanent target error on {job.parent}, "
+                        f"aborting sync: {exc!r}"
+                    )
+                    self.error_notifier.send((exc, self.serialize_exception(exc)))
+                    self.job_notifier.send(True)
+                    self.close_cached_streams()
+                    raise
             except Exception as exc:
                 job.attempts += 1
                 self.logger.info(f"job.attempts : {job.attempts}")
@@ -440,8 +499,14 @@ class StorageWriteBatchWorker(BaseWorker):
         self.log_notifier.send("Worker process exiting.")
 
     def close_cached_streams(self) -> None:
-        """Close all cached streams."""
-        for _, stream, _ in self.cache.values():
+        """Close all cached streams AND their gRPC channels.
+
+        Closing the stream alone leaves the client's gRPC channel (and its
+        background polling thread) open; a worker that reopens streams many
+        times then accumulates channels/threads unbounded (PQ-3820) — the leak
+        that pegged whole nodes on long Silverfin -> BigQuery syncs. Close the
+        client transport too."""
+        for _, stream, _, client in self.cache.values():
             try:
                 stream.close()
             except bqstorage_exceptions.StreamClosedError:
@@ -452,6 +517,28 @@ class StorageWriteBatchWorker(BaseWorker):
                 pass
             except Exception as exc:
                 self.error_notifier.send((exc, self.serialize_exception(exc)))
+            _close_client(client)
+
+    def _close_cached_client(self, parent: str) -> None:
+        """Close the cached client's gRPC channel for ``parent`` (if any) before
+        it is replaced on reopen, so the superseded channel/thread doesn't leak
+        (PQ-3820)."""
+        entry = self.cache.get(parent)
+        if entry is not None:
+            _close_client(entry[3])
+
+    def _assert_target_table_exists(self, parent: str) -> None:
+        """Fast-fail if the destination table no longer exists.
+
+        The default-stream lazy bidi ``open()`` HANGS on a deleted table instead
+        of raising (``get_write_stream`` on ``_default`` does NOT 404 — verified),
+        and every hung attempt leaks a ``consume_request_iterator`` thread
+        (PQ-3820). A cheap ``get_table()`` 404s immediately, surfacing ``NotFound``
+        so the sync aborts via the permanent-error path instead of wedging and
+        leaking threads."""
+        ref = BigQueryWriteClient.parse_table_path(parent)
+        table_id = "%s.%s.%s" % (ref["project"], ref["dataset"], ref["table"])
+        bigquery_client_factory(self.credentials).get_table(table_id)  # raises NotFound if gone
 
     def _ensure_stream(self, job: Job) -> Dispatcher:
         """Return a usable dispatcher for job.parent, opening a fresh
@@ -459,6 +546,8 @@ class StorageWriteBatchWorker(BaseWorker):
         reopen path)."""
         entry = self.cache.get(job.parent)
         if entry is None or entry[1]._closed:
+            self._assert_target_table_exists(job.parent)  # fast-fail on dropped table (PQ-3820)
+            self._close_cached_client(job.parent)  # close superseded channel (PQ-3820)
             client: BigQueryWriteClient = fresh_storage_client(self.credentials)
             entry = self.cache[job.parent] = self.get_stream_components(client, job)
         return cast(StreamComponents, entry)[2]
@@ -478,7 +567,12 @@ class StorageWriteBatchWorker(BaseWorker):
             try:
                 future.result(timeout=APPEND_RESULT_TIMEOUT)
             except Exception as exc:
-                retriable = (attempts < MAX_APPEND_ATTEMPTS
+                # A permanent target failure (e.g. table deleted mid-sync) can
+                # never succeed on a resend and would drive an endless
+                # reopen -> fresh-channel storm (PQ-3820); report it instead of
+                # retrying so the sync fails fast.
+                retriable = (not isinstance(exc, PERMANENT_ERRORS)
+                             and attempts < MAX_APPEND_ATTEMPTS
                              and job.template.write_stream.endswith("_default"))
                 if retriable:
                     if isinstance(exc, concurrent.futures.TimeoutError):
@@ -698,6 +792,10 @@ class BigQueryStorageWriteSink(BaseBigQuerySink):
         if self.proto_rows.serialized_rows:
             while self.global_queue.qsize() >= self.MAX_JOBS_QUEUED:
                 self.logger.warn(f"Max jobs enqueued reached ({self.MAX_JOBS_QUEUED})")
+                # Respawn dead workers + fail fast on a reported worker error so a
+                # stalled queue (e.g. the table was deleted) can't spin here
+                # forever without ever noticing the failure (PQ-3820).
+                self._pump_backpressure()
                 sleep(1)
 
             self.global_queue.put(
