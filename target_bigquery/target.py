@@ -60,6 +60,7 @@ pending and NOT a single job completes in between, the target is unreachable
 (e.g. its table was deleted mid-sync) — stop respawning and abort instead of
 looping forever."""
 
+
 class TargetBigQuery(Target):
     """Target for BigQuery."""
 
@@ -335,6 +336,18 @@ class TargetBigQuery(Target):
             ),
             allowed_values=[1, 2],
         ),
+        th.Property(
+            "checkpoint_row_threshold",
+            th.IntegerType,
+            default=10_000,
+            description=(
+                "The number of records to process (across all streams) before triggering a mid-run"
+                " checkpoint (MERGE staged rows into the target table and emit a STATE message) at"
+                " the next category/stream boundary. Only applies to merge/upsert streams. A value"
+                " of 0 checkpoints at every category boundary; a very large value effectively"
+                " disables mid-run checkpoints (only end-of-pipe finalizes)."
+            ),
+        ),
     ).to_dict()
 
     def __init__(self, *args, **kwargs) -> None:
@@ -378,6 +391,19 @@ class TargetBigQuery(Target):
         self.worker_pings: Dict[str, float] = {}
         self._jobs_enqueued = 0
         self._last_worker_creation = 0.0
+        # Mid-run checkpoint trigger (PQ-3547): count records across all
+        # streams since the last checkpoint; a STATE message at or past the
+        # threshold triggers a non-endofpipe drain_all() (MERGE + emit state).
+        self._checkpoint_row_threshold = int(self.config.get("checkpoint_row_threshold", 10_000))
+        self._records_since_checkpoint = 0
+        self._last_schema_stream = None
+        # Track an un-emitted STATE independently of the record counter. A
+        # max-age drain_all() resets _records_since_checkpoint to 0 (emitting the
+        # then-current state); if the tap then emits a table's final STATE with no
+        # new records, the counter stays 0 and the stream-boundary check would
+        # skip that final bookmark. This flag lets the boundary drain fire when a
+        # STATE is pending even though no records have accrued (PQ-3547).
+        self._state_pending = False
         # PQ-3820: counts worker respawns since the last completed job. Reset in
         # drain_one on every completion ping; tripped in resize_worker_pool.
         self._respawns_since_progress = 0
@@ -551,6 +577,123 @@ class TargetBigQuery(Target):
             return
         super()._process_unknown_message(message_dict)
 
+    def _process_record_message(self, message_dict: dict) -> None:
+        """Process a RECORD message, then tally it toward the checkpoint window."""
+        super()._process_record_message(message_dict)
+        self._records_since_checkpoint += 1
+
+    def _method_supports_checkpoint(self) -> bool:
+        """Whether the configured target method supports the non-destructive
+        checkpoint()/MERGE path PQ-3547 relies on. Only `batch_job` and
+        `storage_write_api` do; `gcs_stage` and `streaming_insert` keep their
+        origin/master mid-run behavior. The default method is
+        `storage_write_api`."""
+        return self.config.get("method", "storage_write_api") in (
+            "batch_job",
+            "storage_write_api",
+        )
+
+    def _sink_checkpoint_eligible(self, sink: "BaseBigQuerySink") -> bool:
+        """Whether an individual active sink may be checkpointed (MERGE) on a
+        mid-run drain. Eligible only when the method supports checkpointing AND
+        the sink is upserting (`merge_target is not None`) AND it is not an
+        overwrite sink (`overwrite_target is None`). An overwrite sink DROPs +
+        recreates the real table, and mid-run that would truncate/replace it
+        before end-of-pipe -- not this feature's contract.
+
+        Used per sink in drain_all()'s non-endofpipe branch: this is the gate
+        that also covers the singer-sdk max-age drain, which calls
+        drain_all(is_endofpipe=False) directly and bypasses the
+        _process_state_message trigger below."""
+        return (
+            self._method_supports_checkpoint()
+            and getattr(sink, "merge_target", None) is not None
+            and getattr(sink, "overwrite_target", None) is None
+        )
+
+    def _row_threshold_checkpoint_eligible(self) -> bool:
+        """Whether this run is in scope for PQ-3547 row-threshold mid-run
+        checkpoints (MERGE + STATE at a category boundary).
+
+        Requires the method to support checkpointing and at least one active
+        sink to be actually upserting (`merge_target is not None`). If ANY
+        active sink is in overwrite mode the whole run stays out of scope
+        (origin/master behavior) -- §5.3 trigger condition "no active sink is
+        in overwrite mode". The per-sink drain_all gate
+        (_sink_checkpoint_eligible) is finer-grained; this run-level gate only
+        decides whether the row-threshold trigger fires at all."""
+        if not self._method_supports_checkpoint():
+            return False
+        sinks = list(self._sinks_active.values())
+        if any(getattr(sink, "overwrite_target", None) is not None for sink in sinks):
+            return False
+        return any(getattr(sink, "merge_target", None) is not None for sink in sinks)
+
+    def _process_state_message(self, message_dict: dict) -> None:
+        """Process a STATE message (category/stream boundary), then checkpoint
+        mid-run if enough records have accrued since the last checkpoint.
+
+        threshold == 0 means every category boundary checkpoints (counter is
+        always >= 0). A very large threshold effectively disables mid-run
+        checkpoints (only max-age and end-of-pipe still finalize).
+        """
+        super()._process_state_message(message_dict)
+        # A STATE arrived and may need emitting at the next boundary even if the
+        # record counter is reset by a max-age drain before then (PQ-3547).
+        self._state_pending = True
+        if (
+            self._checkpoint_row_threshold >= 0
+            and self._records_since_checkpoint >= self._checkpoint_row_threshold
+            and self._row_threshold_checkpoint_eligible()
+        ):
+            self.drain_all(is_endofpipe=False)
+
+    def _process_schema_message(self, message_dict: dict) -> None:
+        """Checkpoint the completed previous table at a genuine stream boundary.
+
+        A SCHEMA for a DIFFERENT stream means the previous table is done. We
+        checkpoint it here regardless of the row threshold, so even a small
+        table (below checkpoint_row_threshold) gets its bookmark persisted per
+        PQ-3547 "bookmark after each table". The threshold still coalesces
+        checkpoints WITHIN a single long stream. A re-emitted/evolved schema for
+        the SAME stream is not a boundary. Gated the same as the threshold
+        trigger (eligible method + a merge sink + no overwrite sink) and only
+        when there are un-checkpointed records OR a pending un-emitted STATE, so
+        it is a no-op for out-of-scope methods and adds no empty drains.
+        """
+        stream = message_dict.get("stream")
+        if (
+            self._last_schema_stream is not None
+            and stream != self._last_schema_stream
+            and (self._records_since_checkpoint > 0 or self._state_pending)
+            and self._row_threshold_checkpoint_eligible()
+        ):
+            self.drain_all(is_endofpipe=False)
+        self._last_schema_stream = stream
+        super()._process_schema_message(message_dict)
+
+    def _shutdown_workers(self) -> None:
+        """Tear down the worker PROCESSES only -- never touches sinks or state.
+
+        This is the process-teardown half of the old drain_all(is_endofpipe=True)
+        body, extracted so the error path in drain_one() can stop workers WITHOUT
+        going through the sink clean_up() / checkpoint() / _flush_deletes() /
+        _write_state_message() machinery. Emitting a STATE message after a worker
+        reported a load failure would advance the bookmark past a failed batch and
+        silently drop data (PQ-3547 P0).
+
+        Uses a stable snapshot of self.workers and is safe on an empty list. This
+        also fixes the old inline join loop
+        (`while len(self.workers): worker.join(); worker = self.workers.pop()`),
+        which double-joined the last worker and skipped the first."""
+        workers = list(self.workers)
+        for worker in workers:
+            if worker.is_alive():
+                self.queue.put(None)
+        for worker in workers:
+            worker.join()
+        self.workers.clear()
+
     def _pump_backpressure(self) -> None:
         """Called from a sink's enqueue backpressure loop (process_batch) while
         the job queue is full. Unlike drain_one it does NOT drain sinks (which
@@ -586,41 +729,83 @@ class TargetBigQuery(Target):
             e, msg = self.error_notification.recv()
             if self.config.get("fail_fast", True):
                 self.logger.error(msg)
+                # Tear down worker PROCESSES only and re-raise. We must NOT call
+                # drain_all() here: that path runs sink.clean_up()/checkpoint(),
+                # _flush_deletes() and _write_state_message(), which would emit a
+                # STATE message advancing the bookmark past the failed batch and
+                # silently drop data on resume (PQ-3547 P0). Preserve the original
+                # error even if teardown itself fails -- no fallback may emit STATE.
                 try:
-                    # Try to drain if we can. This is a best effort.
-                    # TODO: we should consider if draining here is the right thing
-                    # to do. It's _possible_ we increment the state message when
-                    # data is not actually written. Its _unlikely_ so the upside is
-                    # greater than the downside for now but will revisit this.
-                    self.logger.error("Draining all sinks and terminating.")
-                    self.drain_all(is_endofpipe=True)
+                    self._shutdown_workers()
                 except Exception:
-                    self.logger.error("Drain failed.")
+                    self.logger.error("Worker shutdown after error failed.")
                 raise RuntimeError(msg) from e
+        # Lazy staging generation (PQ-3547): a merge sink whose generation was
+        # closed by a previous checkpoint gets a fresh staging table here,
+        # immediately before its buffered records are turned into jobs. Gated
+        # on current_size so empty drains never create a table.
+        if sink.current_size:
+            sink.ensure_staging()
         super().drain_one(sink)
 
     def drain_all(self, is_endofpipe: bool = False) -> None:  # type: ignore
         """Drain all sinks and write state message. If is_endofpipe, execute clean_up() on all sinks.
-        Includes an additional hook to allow sinks to do any pre-state message processing."""
+
+        Fail-fast checkpoint finalization (PQ-3547): sinks are finalized
+        (checkpoint() mid-run / clean_up() at end-of-pipe) in a plain loop
+        with no per-sink exception handling. The first failure propagates
+        immediately, before `_flush_deletes()` and before
+        `_write_state_message()` run, so a failed checkpoint/clean_up emits
+        no STATE for that boundary and the process exits non-zero. Earlier
+        sinks that already finalized successfully in the same loop are not
+        rolled back -- their data is durable and safe to replay (upsert +
+        dedupe), but no new STATE reflects them until a later run succeeds.
+        """
         state = copy.deepcopy(self._latest_state)
         sink: BaseBigQuerySink
         self._drain_all(list(self._sinks_active.values()), self.max_parallelism)
         if is_endofpipe:
-            for worker in self.workers:
-                if worker.is_alive():
-                    self.queue.put(None)
-            while len(self.workers):
-                worker.join()
-                worker = self.workers.pop()
+            # Tear down worker processes via the shared helper (fixes the old
+            # double-join/skip-first bug), THEN finalize sinks. Order preserved:
+            # shutdown -> raise pending worker error -> clean_up() -> _flush_deletes
+            # -> _write_state_message (the last three below, outside this branch).
+            self._shutdown_workers()
             self._raise_pending_worker_error()
             for sink in self._sinks_active.values():
                 sink.clean_up()
         else:
-            for worker in self.workers:
-                worker.join()
+            # Mid-run drain (row-threshold / max-age checkpoint). Tear down
+            # worker processes via the shared helper, which enqueues a None
+            # sentinel per alive worker so each exits its blocking
+            # queue.get(timeout=30.0) immediately -- a bare join() here would
+            # block ~30s per worker until that Empty timeout elapsed, wasting
+            # tens of minutes over a data-heavy stream that checkpoints often
+            # (PQ-3547). It also clears self.workers, so resize_worker_pool()
+            # in drain_one() re-grows the pool on the next records.
+            self._shutdown_workers()
             self._raise_pending_worker_error()
+            # Run-level overwrite exclusion (PQ-3547 §5.3/§10, P2). This branch
+            # also runs on the singer-sdk max-age timer (_handle_max_record_age
+            # -> drain_all(is_endofpipe=False)), which bypasses the
+            # _process_state_message trigger. The rule is run-level: if ANY active
+            # sink is in overwrite mode, NO sink is checkpointed on the mid-run
+            # drain -- every sink keeps its origin/master pre_state_hook()
+            # behavior. Per-sink gating alone would wrongly MERGE an upsert sink
+            # that coexists with an overwrite sink. With no overwrite target
+            # present, fall back to the finer-grained per-sink eligibility gate so
+            # out-of-scope sinks (gcs_stage/streaming_insert) still use
+            # pre_state_hook(). Fail-fast: no try/except -- the first checkpoint()
+            # error propagates before the counter reset and STATE.
+            has_overwrite = any(
+                getattr(sink, "overwrite_target", None) is not None
+                for sink in self._sinks_active.values()
+            )
             for sink in self._sinks_active.values():
-                sink.pre_state_hook()
+                if not has_overwrite and self._sink_checkpoint_eligible(sink):
+                    sink.checkpoint()
+                else:
+                    sink.pre_state_hook()
+            self._records_since_checkpoint = 0
         # Apply buffered DELETERECORDs *before* advancing state, so the bookmark
         # never moves past deletes that were not applied. At end-of-pipe this runs
         # after the clean_up() upserts above (an upsert + delete of the same key in
@@ -630,6 +815,9 @@ class TargetBigQuery(Target):
             self._flush_deletes()
         if state:
             self._write_state_message(state)
+            # The pending STATE has now been emitted; clear the flag so a later
+            # stream boundary does not force a redundant empty drain (PQ-3547).
+            self._state_pending = False
         self._reset_max_record_age()
 
     def _raise_pending_worker_error(self) -> None:

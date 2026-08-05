@@ -685,12 +685,24 @@ class BigQueryStorageWriteSink(BaseBigQuerySink):
         self._fallback_rows = 0
         self._fallback_jobs: List[bigquery.LoadJob] = []
         self.open_streams: Set[Tuple[str, writer.AppendRowsStream]] = set()
+        self.stream_notification, self.stream_notifier = target.pipe_cls(False)
+        self._refresh_write_destination()
+
+    def _refresh_write_destination(self) -> None:
+        """(Re)compute the write destination from the CURRENT `self.table`.
+
+        `self.parent` and `self.template` (its embedded `write_stream`) both
+        encode the staging table generation. `BaseBigQuerySink.checkpoint()`
+        rotates `self.table` to a fresh staging table after a successful
+        MERGE, but does not know about these storage_write-specific
+        attributes — so this must be called both at __init__ time and again
+        immediately after every successful rotation (PQ-3547 C1), otherwise
+        already-queued/future Jobs keep targeting the dropped old generation."""
         self.parent = BigQueryWriteClient.table_path(
             self.table.project,
             self.table.dataset,
             self.table.name,
         )
-        self.stream_notification, self.stream_notifier = target.pipe_cls(False)
         self.template = generate_template(self.proto_schema)
 
     @property
@@ -833,7 +845,11 @@ class BigQueryStorageWriteSink(BaseBigQuerySink):
                 )
             )
             self.logger.info(f"Batch commit time: {write.commit_time}")
-            self.logger.info(f"Batch commit errors: {write.stream_errors}")
+            if write.stream_errors:
+                self.logger.error(f"Storage Write batch commit failed: {write.stream_errors}")
+                raise RuntimeError(
+                    f"Storage Write batch_commit_write_streams reported stream errors: {write.stream_errors}"
+                )
             self.logger.info(f"Writes to streams: '{self.open_streams}' have been committed.")
         self.open_streams = set()
 
@@ -845,6 +861,24 @@ class BigQueryStorageWriteSink(BaseBigQuerySink):
     def pre_state_hook(self) -> None:
         self.commit_streams()
         self._wait_for_fallback_jobs()
+
+    def checkpoint(self) -> None:
+        # Durability barrier before the mid-run MERGE: commit any application
+        # streams (no-op for _default) and await oversized-row fallback Load
+        # Jobs, so every staged row is in the temp before we merge. Mirrors
+        # clean_up() above, but for the non-terminal, repeatable checkpoint.
+        # super().checkpoint() closes the staging generation without creating
+        # a successor; parent/template are recomputed in _on_staging_rotated()
+        # when the next batch lazily reopens one (PQ-3547 C1).
+        self.commit_streams()
+        self._wait_for_fallback_jobs()
+        super().checkpoint()
+
+    def _on_staging_rotated(self) -> None:
+        # ensure_staging() pointed self.table at a fresh staging generation;
+        # recompute parent/template so every subsequent Job (and any stream
+        # open) targets the new generation, never a dropped one (PQ-3547 C1).
+        self._refresh_write_destination()
 
 
 def _stringify_json_columns(record: Dict[str, Any], fields: List[Any]) -> Dict[str, Any]:

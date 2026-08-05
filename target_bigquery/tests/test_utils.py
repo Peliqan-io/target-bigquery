@@ -1,3 +1,4 @@
+from collections import OrderedDict
 from typing import List
 
 import pytest
@@ -894,3 +895,1074 @@ def test_flush_skips_empty_record_lists():
     t, client = _run_flush({"Accounts": []})
     client.query.assert_not_called()
     assert t._delete_buffer == {}
+
+
+# --------------------------------------------------------------------------- #
+# checkpoint() — mid-run MERGE (PQ-3547)                                        #
+# --------------------------------------------------------------------------- #
+from copy import copy as _copy
+
+
+def _merge_sink():
+    """A BaseBigQuerySink-like object with merge staging, no __init__/BQ."""
+    from target_bigquery.core import BaseBigQuerySink, BigQueryTable, IngestionStrategy
+
+    # BaseBigQuerySink is abstract (process_batch/worker_cls_factory), so
+    # object.__new__ refuses to instantiate it directly. A trivial concrete
+    # subclass sidesteps that without changing any inherited behavior we
+    # exercise here (checkpoint()/_new_staging_table() are defined on the
+    # base class itself).
+    class _ConcreteSink(BaseBigQuerySink):
+        def process_batch(self, context):
+            raise NotImplementedError
+
+        @staticmethod
+        def worker_cls_factory(worker_executor_cls, config):
+            raise NotImplementedError
+
+    s = _ConcreteSink.__new__(_ConcreteSink)
+    s.client = MagicMock()
+    s.stream_name = "SalesInvoiceLines"
+    s._key_properties = ["id"]  # key_properties is a read-only property in the SDK base
+    s._config = {"project": "p", "dataset": "d"}  # config is also a read-only property
+    opts = {
+        "project": "p", "dataset": "d", "jsonschema": {"properties": {}},
+        "transforms": {}, "ingestion_strategy": IngestionStrategy.DENORMALIZED,
+    }
+    s._staging_opts = opts
+    s._staging_seq = 0
+    real = BigQueryTable(name="salesinvoicelines", **opts)
+    s.merge_target = _copy(real)
+    s.table = BigQueryTable(name="salesinvoicelines__100", **opts)
+    # apply_transforms is a read-only property (derived from ingestion_strategy)
+    # and is unused by checkpoint()/_merge_staging_into_target(); not set here.
+    return s
+
+
+def test_checkpoint_merges_and_rotates_temp_without_teardown(monkeypatch):
+    s = _merge_sink()
+    # stub dedupe/merge to avoid building real SQL/schema
+    monkeypatch.setattr(type(s), "_is_dedupe_before_upsert_candidate", lambda self: False)
+    created = []
+    monkeypatch.setattr(type(s), "_new_staging_table",
+                        lambda self: created.append(True))
+    prev_target = s.merge_target
+    s.checkpoint()
+    assert s.client.query.called                 # a MERGE was issued
+    assert created == [True]                      # fresh temp rotated in
+    assert s.merge_target is prev_target          # merge_target NOT torn down
+
+
+def test_checkpoint_raises_and_does_not_drop_on_merge_failure(monkeypatch):
+    s = _merge_sink()
+    monkeypatch.setattr(type(s), "_is_dedupe_before_upsert_candidate", lambda self: False)
+    monkeypatch.setattr(type(s), "_new_staging_table", lambda self: None)
+    s.client.query.side_effect = Exception("schema mismatch")
+    with pytest.raises(Exception):
+        s.checkpoint()
+    # Exactly one query call was made (the failed MERGE attempt) and no
+    # separate standalone DROP-only query was issued afterward. (The old
+    # buggy code issued a second "DROP TABLE IF EXISTS ..." query in its
+    # except clause; merge_sql itself legitimately ENDS with a DROP TABLE
+    # statement, so asserting on substring "DROP TABLE" would be wrong here.)
+    assert s.client.query.call_count == 1
+
+
+def test_checkpoint_noop_when_no_merge_target(monkeypatch):
+    s = _merge_sink()
+    s.merge_target = None
+    monkeypatch.setattr(type(s), "_new_staging_table",
+                        lambda self: (_ for _ in ()).throw(AssertionError("rotated")))
+    s.checkpoint()                                # must not raise / not rotate
+    assert not s.client.query.called
+
+
+# --------------------------------------------------------------------------- #
+# checkpoint() barrier override for storage_write (PQ-3547)                    #
+# --------------------------------------------------------------------------- #
+def test_storage_write_checkpoint_barrier_before_merge(monkeypatch):
+    """storage_write must commit streams + await fallback Load Jobs BEFORE the
+    MERGE runs (order matters: rows must be durable in the temp first), and
+    must refresh parent/template only AFTER the MERGE (rotation) succeeds."""
+    from target_bigquery.storage_write import BigQueryStorageWriteDenormalizedSink as SW
+    import target_bigquery.core as core
+
+    # BigQueryStorageWriteDenormalizedSink is not abstract (unlike
+    # BaseBigQuerySink), so __new__ works directly without a concrete subclass.
+    s = SW.__new__(SW)
+    calls = []
+    s.commit_streams = lambda: calls.append("commit")
+    s._wait_for_fallback_jobs = lambda: calls.append("fallback")
+    s._refresh_write_destination = lambda: calls.append("refresh")
+    # Base checkpoint() (Task 1) records "merge"; patched via monkeypatch so
+    # it's restored automatically even if the assertion below fails.
+    monkeypatch.setattr(core.BaseBigQuerySink, "checkpoint", lambda self: calls.append("merge"))
+
+    SW.checkpoint(s)
+
+    assert calls == ["commit", "fallback", "merge", "refresh"]
+
+
+# --------------------------------------------------------------------------- #
+# _refresh_write_destination() — generation rotation (PQ-3547 C1)              #
+# --------------------------------------------------------------------------- #
+def _sw_sink():
+    """A BigQueryStorageWriteDenormalizedSink-like object with no BQ/network
+    dependency, built the same way as `_merge_sink()` but with the storage_write
+    write-destination attributes (`parent`/`template`) initialized via
+    `_refresh_write_destination()`, mirroring what `__init__` now does."""
+    from target_bigquery.storage_write import BigQueryStorageWriteDenormalizedSink as SW
+    from target_bigquery.core import BigQueryTable, IngestionStrategy
+    from target_bigquery.proto_gen import proto_schema_factory_v2
+
+    s = SW.__new__(SW)
+    s.client = MagicMock()
+    s.stream_name = "SalesInvoiceLines"
+    s._key_properties = ["id"]  # key_properties is a read-only property in the SDK base
+    s._config = {"project": "p", "dataset": "d"}  # config is also a read-only property
+    opts = {
+        "project": "p", "dataset": "d", "jsonschema": {"properties": {}},
+        "transforms": {}, "ingestion_strategy": IngestionStrategy.DENORMALIZED,
+    }
+    s._staging_opts = opts
+    s._staging_seq = 0
+    real = BigQueryTable(name="salesinvoicelines", **opts)
+    s.merge_target = _copy(real)
+    s.table = BigQueryTable(name="salesinvoicelines__gen1_1", **opts)
+    # Bypass the real schema-translation path (irrelevant to rotation logic);
+    # a real proto message class is still used so generate_template's
+    # descriptor-embedding logic runs unmocked.
+    s._proto_schema = proto_schema_factory_v2([])
+    s.open_streams = set()
+    s._refresh_write_destination()  # what __init__ now does
+    return s
+
+
+def test_refresh_write_destination_parent_matches_current_table():
+    from google.cloud.bigquery_storage_v1 import BigQueryWriteClient
+
+    s = _sw_sink()
+    assert s.parent == BigQueryWriteClient.table_path("p", "d", "salesinvoicelines__gen1_1")
+
+
+def test_checkpoint_rotates_parent_and_template_to_generation_two(monkeypatch):
+    """After a successful checkpoint (MERGE + staging-table rotation), `parent`
+    must reference the NEW (generation-2) table and a fresh template object
+    must have been created — never the dropped generation-1 table/template."""
+    from google.cloud.bigquery_storage_v1 import BigQueryWriteClient
+    from target_bigquery.core import BigQueryTable
+    from target_bigquery.storage_write import BigQueryStorageWriteDenormalizedSink as SW
+    import target_bigquery.core as core
+    import target_bigquery.storage_write as sw
+
+    s = _sw_sink()
+    gen1_parent, gen1_template = s.parent, s.template
+    assert gen1_parent == BigQueryWriteClient.table_path("p", "d", "salesinvoicelines__gen1_1")
+
+    s.commit_streams = lambda: None
+    s._wait_for_fallback_jobs = lambda: None
+
+    def fake_super_checkpoint(self):
+        # Mirrors what BaseBigQuerySink.checkpoint() does on a successful
+        # MERGE: rotate self.table to a fresh staging table.
+        self.table = BigQueryTable(name="salesinvoicelines__gen2_1", **self._staging_opts)
+
+    monkeypatch.setattr(core.BaseBigQuerySink, "checkpoint", fake_super_checkpoint)
+    template_calls = []
+    real_generate_template = sw.generate_template
+    monkeypatch.setattr(
+        sw, "generate_template",
+        lambda schema: (template_calls.append(schema), real_generate_template(schema))[1],
+    )
+
+    SW.checkpoint(s)
+
+    expected_gen2_parent = BigQueryWriteClient.table_path("p", "d", "salesinvoicelines__gen2_1")
+    assert s.parent == expected_gen2_parent
+    assert s.parent != gen1_parent
+    assert s.template is not gen1_template
+    assert len(template_calls) == 1  # fresh template built exactly once, post-MERGE
+
+    # A Job created after this checkpoint carries the NEW parent, never the
+    # dropped generation-1 table.
+    job = sw.Job(parent=s.parent, template=s.template, stream_notifier=None, data=None)
+    assert job.parent == expected_gen2_parent
+    assert job.parent != gen1_parent
+
+
+def test_checkpoint_does_not_refresh_destination_when_merge_raises(monkeypatch):
+    """If the MERGE (super().checkpoint()) raises, no rotation happened, so
+    parent/template must be left pointing at the still-current staging table."""
+    from target_bigquery.storage_write import BigQueryStorageWriteDenormalizedSink as SW
+    import target_bigquery.core as core
+    import target_bigquery.storage_write as sw
+
+    s = _sw_sink()
+    gen1_parent, gen1_template = s.parent, s.template
+
+    s.commit_streams = lambda: None
+    s._wait_for_fallback_jobs = lambda: None
+    monkeypatch.setattr(
+        core.BaseBigQuerySink, "checkpoint",
+        lambda self: (_ for _ in ()).throw(Exception("merge failed")),
+    )
+    refresh_calls = []
+    monkeypatch.setattr(
+        sw.BigQueryStorageWriteSink, "_refresh_write_destination",
+        lambda self: refresh_calls.append(True),
+    )
+
+    with pytest.raises(Exception, match="merge failed"):
+        SW.checkpoint(s)
+
+    assert refresh_calls == []          # never reached — merge raised first
+    assert s.parent == gen1_parent      # unchanged: still generation 1
+    assert s.template is gen1_template  # unchanged: same template object
+
+
+class _FakeSink:
+    """Minimal stand-in for a BaseBigQuerySink used only to carry
+    merge_target/overwrite_target for scope-gating checks (§5.3). Not a
+    MagicMock, since a MagicMock's un-configured attribute access returns a
+    truthy Mock rather than None, which would defeat the `is not None`
+    checks under test."""
+
+    def __init__(self, merge_target=None, overwrite_target=None):
+        self.merge_target = merge_target
+        self.overwrite_target = overwrite_target
+
+
+# --------------------------------------------------------------------------- #
+# checkpoint_row_threshold config + record counter + STATE trigger (PQ-3547)   #
+# --------------------------------------------------------------------------- #
+def _counter_target(threshold, method="batch_job", sinks_active=None):
+    from target_bigquery.target import TargetBigQuery
+
+    t = TargetBigQuery.__new__(TargetBigQuery)
+    t._config = {
+        "project": "p",
+        "dataset": "d",
+        "checkpoint_row_threshold": threshold,
+        "method": method,
+    }
+    t._records_since_checkpoint = 0
+    t._state_pending = False
+    t._checkpoint_row_threshold = threshold
+    t._latest_state = {"bookmarks": {}}
+    # Default: one eligible (upserting) sink, so threshold tests exercise only
+    # the counter/threshold logic. Scope-gating tests override this.
+    t._sinks_active = (
+        sinks_active if sinks_active is not None else {"A": _FakeSink(merge_target=object())}
+    )
+    t.drain_all = MagicMock()
+    return t
+
+
+def test_state_message_triggers_checkpoint_when_threshold_met(monkeypatch):
+    import target_bigquery.target as tgt
+
+    # Target (TargetBigQuery.__mro__[1]) defines the SDK base
+    # _process_state_message; stub it so our override's own logic (call
+    # super() then evaluate the trigger) is what's under test.
+    assert tgt.TargetBigQuery.__mro__[1].__name__ == "Target"
+    monkeypatch.setattr(
+        tgt.TargetBigQuery.__mro__[1], "_process_state_message", lambda self, m: None
+    )
+    t = _counter_target(threshold=3)
+    t._records_since_checkpoint = 3
+    t._process_state_message({"type": "STATE", "value": {"bookmarks": {"A": 1}}})
+    t.drain_all.assert_called_once_with(is_endofpipe=False)
+
+
+def test_state_message_no_checkpoint_below_threshold(monkeypatch):
+    import target_bigquery.target as tgt
+
+    monkeypatch.setattr(
+        tgt.TargetBigQuery.__mro__[1], "_process_state_message", lambda self, m: None
+    )
+    t = _counter_target(threshold=1000)
+    t._records_since_checkpoint = 10
+    t._process_state_message({"type": "STATE", "value": {}})
+    t.drain_all.assert_not_called()
+
+
+def test_record_message_increments_counter(monkeypatch):
+    import target_bigquery.target as tgt
+
+    monkeypatch.setattr(
+        tgt.TargetBigQuery.__mro__[1], "_process_record_message", lambda self, m: None
+    )
+    t = _counter_target(threshold=1000)
+    t._process_record_message({"type": "RECORD", "stream": "A", "record": {}})
+    assert t._records_since_checkpoint == 1
+
+
+@pytest.mark.parametrize("threshold", [0, 1])
+def test_threshold_zero_checkpoints_every_boundary_positive_coalesces(monkeypatch, threshold):
+    import target_bigquery.target as tgt
+
+    monkeypatch.setattr(
+        tgt.TargetBigQuery.__mro__[1], "_process_state_message", lambda self, m: None
+    )
+    t = _counter_target(threshold=threshold)
+    t._records_since_checkpoint = 0
+    # threshold 0: 0 >= 0 -> every boundary checkpoints.
+    # threshold 1: 0 >= 1 is False -> this boundary does NOT checkpoint yet.
+    t._process_state_message({"type": "STATE", "value": {}})
+    if threshold == 0:
+        t.drain_all.assert_called_once_with(is_endofpipe=False)
+    else:
+        t.drain_all.assert_not_called()
+
+
+# --------------------------------------------------------------------------- #
+# row-threshold trigger scope gating (§5.3): only batch_job/storage_write_api #
+# with an active upsert (merge_target) sink, and never with an overwrite     #
+# sink, may take the mid-run row-threshold checkpoint path.                  #
+# --------------------------------------------------------------------------- #
+@pytest.mark.parametrize("method", ["gcs_stage", "streaming_insert"])
+def test_no_row_threshold_checkpoint_for_out_of_scope_methods(monkeypatch, method):
+    import target_bigquery.target as tgt
+
+    monkeypatch.setattr(
+        tgt.TargetBigQuery.__mro__[1], "_process_state_message", lambda self, m: None
+    )
+    t = _counter_target(
+        threshold=0,
+        method=method,
+        sinks_active={"A": _FakeSink(merge_target=object())},
+    )
+    t._records_since_checkpoint = 0
+    t._process_state_message({"type": "STATE", "value": {}})
+    t.drain_all.assert_not_called()
+
+
+@pytest.mark.parametrize("method", ["batch_job", "storage_write_api"])
+def test_no_row_threshold_checkpoint_when_a_sink_is_overwrite_mode(monkeypatch, method):
+    import target_bigquery.target as tgt
+
+    monkeypatch.setattr(
+        tgt.TargetBigQuery.__mro__[1], "_process_state_message", lambda self, m: None
+    )
+    t = _counter_target(
+        threshold=0,
+        method=method,
+        sinks_active={
+            "A": _FakeSink(merge_target=object()),
+            "B": _FakeSink(overwrite_target=object()),
+        },
+    )
+    t._records_since_checkpoint = 0
+    t._process_state_message({"type": "STATE", "value": {}})
+    t.drain_all.assert_not_called()
+
+
+@pytest.mark.parametrize("method", ["batch_job", "storage_write_api"])
+def test_row_threshold_checkpoint_eligible_for_batch_job_and_storage_write_upsert(
+    monkeypatch, method
+):
+    import target_bigquery.target as tgt
+
+    monkeypatch.setattr(
+        tgt.TargetBigQuery.__mro__[1], "_process_state_message", lambda self, m: None
+    )
+    t = _counter_target(
+        threshold=0,
+        method=method,
+        sinks_active={"A": _FakeSink(merge_target=object())},
+    )
+    t._records_since_checkpoint = 0
+    t._process_state_message({"type": "STATE", "value": {}})
+    t.drain_all.assert_called_once_with(is_endofpipe=False)
+
+
+@pytest.mark.parametrize("method", ["batch_job", "storage_write_api"])
+def test_no_row_threshold_checkpoint_when_no_sink_is_upserting(monkeypatch, method):
+    """Pure append-mode sinks (no merge_target, no overwrite_target) are not
+    in scope either -- there is nothing for checkpoint()/MERGE to do."""
+    import target_bigquery.target as tgt
+
+    monkeypatch.setattr(
+        tgt.TargetBigQuery.__mro__[1], "_process_state_message", lambda self, m: None
+    )
+    t = _counter_target(threshold=0, method=method, sinks_active={"A": _FakeSink()})
+    t._records_since_checkpoint = 0
+    t._process_state_message({"type": "STATE", "value": {}})
+    t.drain_all.assert_not_called()
+
+
+# --------------------------------------------------------------------------- #
+# SCHEMA-message table-boundary checkpoint (PQ-3547 "bookmark after each       #
+# table"): a SCHEMA for a NEW stream means the previous table is done, so it   #
+# is checkpointed regardless of the row threshold -- even a small table below  #
+# checkpoint_row_threshold gets its bookmark persisted. A same-stream re-emit  #
+# is not a boundary, and a boundary with no un-checkpointed data adds no drain.#
+# --------------------------------------------------------------------------- #
+def test_schema_boundary_checkpoints_small_completed_table(monkeypatch):
+    """Table A completes with only ~100 records (well below the 10_000 default
+    threshold); a SCHEMA for a different stream B is a genuine table boundary,
+    so A is checkpointed via drain_all(is_endofpipe=False) anyway."""
+    import target_bigquery.target as tgt
+
+    # Target (TargetBigQuery.__mro__[1]) defines the SDK base
+    # _process_schema_message (which only registers the schema, never drains);
+    # patch it so the test needs no real mapper and our override's own boundary
+    # logic is what's under test.
+    assert tgt.TargetBigQuery.__mro__[1].__name__ == "Target"
+    monkeypatch.setattr(
+        tgt.TargetBigQuery.__mro__[1], "_process_schema_message", lambda self, m: None
+    )
+    t = _counter_target(threshold=10_000)
+    t._row_threshold_checkpoint_eligible = MagicMock(return_value=True)
+    t._last_schema_stream = "A"
+    t._records_since_checkpoint = 100  # small table, far below threshold
+    t._process_schema_message(
+        {"stream": "B", "schema": {"properties": {}}, "key_properties": []}
+    )
+    t.drain_all.assert_called_once_with(is_endofpipe=False)
+    assert t._last_schema_stream == "B"  # boundary advanced
+
+
+def test_schema_reemit_same_stream_does_not_checkpoint(monkeypatch):
+    """A re-emitted/evolved SCHEMA for the SAME stream is not a table boundary,
+    so it must not trigger a checkpoint drain."""
+    import target_bigquery.target as tgt
+
+    monkeypatch.setattr(
+        tgt.TargetBigQuery.__mro__[1], "_process_schema_message", lambda self, m: None
+    )
+    t = _counter_target(threshold=10_000)
+    t._row_threshold_checkpoint_eligible = MagicMock(return_value=True)
+    t._last_schema_stream = "A"
+    t._records_since_checkpoint = 100
+    t._process_schema_message(
+        {"stream": "A", "schema": {"properties": {}}, "key_properties": []}
+    )
+    t.drain_all.assert_not_called()
+    assert t._last_schema_stream == "A"
+
+
+def test_schema_boundary_no_checkpoint_when_no_records(monkeypatch):
+    """A genuine boundary but with nothing un-checkpointed
+    (_records_since_checkpoint == 0) is a no-op: no empty drain is added."""
+    import target_bigquery.target as tgt
+
+    monkeypatch.setattr(
+        tgt.TargetBigQuery.__mro__[1], "_process_schema_message", lambda self, m: None
+    )
+    t = _counter_target(threshold=10_000)
+    t._row_threshold_checkpoint_eligible = MagicMock(return_value=True)
+    t._last_schema_stream = "A"
+    t._records_since_checkpoint = 0
+    t._process_schema_message(
+        {"stream": "B", "schema": {"properties": {}}, "key_properties": []}
+    )
+    t.drain_all.assert_not_called()
+    assert t._last_schema_stream == "B"
+
+
+def test_first_schema_of_run_does_not_checkpoint(monkeypatch):
+    """The very first SCHEMA of a run (no previous table,
+    _last_schema_stream is None) sets the tracked stream but must not drain."""
+    import target_bigquery.target as tgt
+
+    monkeypatch.setattr(
+        tgt.TargetBigQuery.__mro__[1], "_process_schema_message", lambda self, m: None
+    )
+    t = _counter_target(threshold=10_000)
+    t._row_threshold_checkpoint_eligible = MagicMock(return_value=True)
+    t._last_schema_stream = None
+    t._records_since_checkpoint = 5
+    t._process_schema_message(
+        {"stream": "A", "schema": {"properties": {}}, "key_properties": []}
+    )
+    t.drain_all.assert_not_called()
+    assert t._last_schema_stream == "A"
+
+
+# --------------------------------------------------------------------------- #
+# SCHEMA-boundary checkpoint on a PENDING STATE after a max-age counter reset  #
+# (PQ-3547): a singer-sdk max-age drain calls drain_all(is_endofpipe=False),   #
+# which resets _records_since_checkpoint to 0 and emits the then-current       #
+# (pre-final) state. If the tap then emits the table's FINAL STATE (no new     #
+# records), the counter stays 0 but a bookmark is pending; the stream boundary #
+# must still drain it rather than stranding it to EOF/next max-age.            #
+# --------------------------------------------------------------------------- #
+def test_schema_boundary_drains_pending_state_after_maxage_reset(monkeypatch):
+    """Counter already reset to 0 by a preceding max-age drain, then table A's
+    final STATE arrives (updates _latest_state, adds no records) so
+    _state_pending is True. A SCHEMA for a new stream B is a genuine boundary;
+    the pending final bookmark must drain here even though the counter is 0."""
+    import target_bigquery.target as tgt
+
+    assert tgt.TargetBigQuery.__mro__[1].__name__ == "Target"
+    monkeypatch.setattr(
+        tgt.TargetBigQuery.__mro__[1], "_process_schema_message", lambda self, m: None
+    )
+    t = _counter_target(threshold=10_000)
+    t._row_threshold_checkpoint_eligible = MagicMock(return_value=True)
+    t._last_schema_stream = "A"
+    t._records_since_checkpoint = 0  # reset by the preceding max-age drain
+    t._state_pending = True  # A's final STATE arrived, not yet emitted
+    t._process_schema_message(
+        {"stream": "B", "schema": {"properties": {}}, "key_properties": ["id"]}
+    )
+    t.drain_all.assert_called_once_with(is_endofpipe=False)
+    assert t._last_schema_stream == "B"  # boundary advanced
+
+
+def test_schema_boundary_no_drain_when_no_records_and_no_pending_state(monkeypatch):
+    """Genuine boundary but nothing to emit: counter 0 AND no pending STATE ->
+    no redundant empty drain (preserves the no-empty-drains intent)."""
+    import target_bigquery.target as tgt
+
+    monkeypatch.setattr(
+        tgt.TargetBigQuery.__mro__[1], "_process_schema_message", lambda self, m: None
+    )
+    t = _counter_target(threshold=10_000)
+    t._row_threshold_checkpoint_eligible = MagicMock(return_value=True)
+    t._last_schema_stream = "A"
+    t._records_since_checkpoint = 0
+    t._state_pending = False
+    t._process_schema_message(
+        {"stream": "B", "schema": {"properties": {}}, "key_properties": ["id"]}
+    )
+    t.drain_all.assert_not_called()
+    assert t._last_schema_stream == "B"
+
+
+def test_state_message_marks_state_pending(monkeypatch):
+    """A STATE message marks state as pending so a later stream boundary can
+    emit it even after a max-age drain resets the record counter. Uses a high
+    threshold so only the flag is set (no threshold-trigger drain here)."""
+    import target_bigquery.target as tgt
+
+    monkeypatch.setattr(
+        tgt.TargetBigQuery.__mro__[1], "_process_state_message", lambda self, m: None
+    )
+    t = _counter_target(threshold=1000)
+    t._records_since_checkpoint = 0
+    t._state_pending = False
+    t._process_state_message({"type": "STATE", "value": {"bookmarks": {"A": 1}}})
+    assert t._state_pending is True
+    t.drain_all.assert_not_called()  # threshold not met; only the flag was set
+
+
+def test_drain_all_clears_state_pending_after_writing_state():
+    """Once drain_all emits the pending STATE via _write_state_message, the flag
+    clears so a subsequent boundary does not force a redundant empty drain."""
+    from target_bigquery.target import TargetBigQuery
+
+    t = TargetBigQuery.__new__(TargetBigQuery)
+    t._config = {"project": "p", "dataset": "d"}
+    t._latest_state = {"bookmarks": {"A": 5}}
+    sink = _checkpoint_mock_sink(merge_target=object())  # eligible: upsert sink
+    t._sinks_active = {"A": sink}
+    t.workers = []
+    t.max_parallelism = 1
+    t._delete_buffer = {}
+    t._records_since_checkpoint = 0
+    t._state_pending = True
+    t._drain_all = MagicMock()
+    t._raise_pending_worker_error = MagicMock()
+    t._write_state_message = MagicMock()
+    t._reset_max_record_age = MagicMock()
+    t.drain_all(is_endofpipe=False)
+    t._write_state_message.assert_called_once()
+    assert t._state_pending is False
+
+
+# --------------------------------------------------------------------------- #
+# drain_all non-endofpipe path checkpoints (MERGE) + resets counter (PQ-3547) #
+# --------------------------------------------------------------------------- #
+def _checkpoint_mock_sink(merge_target=None, overwrite_target=None):
+    """A MagicMock sink with *real* merge_target/overwrite_target values.
+
+    A bare MagicMock's un-configured attribute is a truthy Mock (never None),
+    which would defeat the `merge_target is not None` / `overwrite_target is
+    None` scope checks the drain_all gate makes per sink. Setting them to real
+    values (object() or None) lets the eligibility predicate behave."""
+    s = MagicMock()
+    s.merge_target = merge_target
+    s.overwrite_target = overwrite_target
+    return s
+
+
+def test_drain_all_non_endofpipe_checkpoints_and_resets_counter():
+    from target_bigquery.target import TargetBigQuery
+
+    t = TargetBigQuery.__new__(TargetBigQuery)
+    t._config = {"project": "p", "dataset": "d"}
+    t._latest_state = {"bookmarks": {"A": 5}}
+    sink = _checkpoint_mock_sink(merge_target=object())  # eligible: upsert sink
+    t._sinks_active = {"A": sink}
+    t.workers = []
+    t.max_parallelism = 1
+    t._delete_buffer = {}
+    t._records_since_checkpoint = 42
+    t._drain_all = MagicMock()
+    t._raise_pending_worker_error = MagicMock()
+    t._write_state_message = MagicMock()
+    t._reset_max_record_age = MagicMock()
+    t.drain_all(is_endofpipe=False)
+    sink.checkpoint.assert_called_once()  # MERGE ran mid-run
+    sink.clean_up.assert_not_called()  # not a teardown
+    assert t._records_since_checkpoint == 0  # window reset
+    t._write_state_message.assert_called_once()
+
+
+# --------------------------------------------------------------------------- #
+# fail-fast checkpoint finalization (PQ-3547 §5.2/§7): the first sink.checkpoint()
+# / sink.clean_up() failure propagates immediately with no try/except around
+# the sink loop. Earlier successful sinks in the same boundary are NOT rolled
+# back, but no STATE is written for that boundary and later sinks are not
+# finalized (fail-fast, not per-stream isolation).                            #
+# --------------------------------------------------------------------------- #
+def _failfast_target(sinks, is_endofpipe):
+    from target_bigquery.target import TargetBigQuery
+
+    t = TargetBigQuery.__new__(TargetBigQuery)
+    t._config = {"project": "p", "dataset": "d"}
+    t._latest_state = {"bookmarks": {"A": 10, "B": 20, "C": 30}}
+    t._sinks_active = sinks
+    t.workers = []
+    t.max_parallelism = 1
+    t._delete_buffer = {}
+    t._records_since_checkpoint = 42
+    t._drain_all = MagicMock()
+    t._raise_pending_worker_error = MagicMock()
+    t._reset_max_record_age = MagicMock()
+    t._write_state_message = MagicMock()
+    return t
+
+
+def test_state_written_after_fully_successful_checkpoint():
+    sinks = OrderedDict(
+        A=_checkpoint_mock_sink(merge_target=object()),
+        B=_checkpoint_mock_sink(merge_target=object()),
+        C=_checkpoint_mock_sink(merge_target=object()),
+    )
+    t = _failfast_target(sinks, is_endofpipe=False)
+    t.drain_all(is_endofpipe=False)
+    for sink in sinks.values():
+        sink.checkpoint.assert_called_once()
+    t._write_state_message.assert_called_once_with({"bookmarks": {"A": 10, "B": 20, "C": 30}})
+    assert t._records_since_checkpoint == 0
+
+
+def test_first_sink_failure_no_state_later_sinks_not_checkpointed():
+    sinks = OrderedDict(
+        A=_checkpoint_mock_sink(merge_target=object()),
+        B=_checkpoint_mock_sink(merge_target=object()),
+        C=_checkpoint_mock_sink(merge_target=object()),
+    )
+    sinks["A"].checkpoint.side_effect = Exception("merge failed")
+    t = _failfast_target(sinks, is_endofpipe=False)
+    with pytest.raises(Exception, match="merge failed"):
+        t.drain_all(is_endofpipe=False)
+    sinks["B"].checkpoint.assert_not_called()
+    sinks["C"].checkpoint.assert_not_called()
+    t._write_state_message.assert_not_called()
+    # Counter reset happens after the checkpoint loop, so a failure must skip it.
+    assert t._records_since_checkpoint == 42
+
+
+def test_later_sink_failure_after_earlier_success_still_fails_fast():
+    sinks = OrderedDict(
+        A=_checkpoint_mock_sink(merge_target=object()),
+        B=_checkpoint_mock_sink(merge_target=object()),
+        C=_checkpoint_mock_sink(merge_target=object()),
+    )
+    sinks["B"].checkpoint.side_effect = Exception("merge failed")
+    t = _failfast_target(sinks, is_endofpipe=False)
+    with pytest.raises(Exception, match="merge failed"):
+        t.drain_all(is_endofpipe=False)
+    sinks["A"].checkpoint.assert_called_once()  # A already ran (not rolled back)
+    sinks["C"].checkpoint.assert_not_called()  # C never reached
+    t._write_state_message.assert_not_called()
+    assert t._records_since_checkpoint == 42  # not reset
+
+
+def test_endofpipe_clean_up_failure_prevents_final_state():
+    sinks = OrderedDict(A=MagicMock(), B=MagicMock())
+    sinks["B"].clean_up.side_effect = Exception("merge failed")
+    t = _failfast_target(sinks, is_endofpipe=True)
+    with pytest.raises(Exception, match="merge failed"):
+        t.drain_all(is_endofpipe=True)
+    sinks["A"].clean_up.assert_called_once()
+    t._write_state_message.assert_not_called()
+
+
+def test_endofpipe_fully_successful_clean_up_writes_final_state():
+    sinks = OrderedDict(A=MagicMock(), B=MagicMock())
+    t = _failfast_target(sinks, is_endofpipe=True)
+    t.drain_all(is_endofpipe=True)
+    for sink in sinks.values():
+        sink.clean_up.assert_called_once()
+    t._write_state_message.assert_called_once_with({"bookmarks": {"A": 10, "B": 20, "C": 30}})
+
+
+# --------------------------------------------------------------------------- #
+# drain_all(is_endofpipe=False) per-sink scope gate (PQ-3547 §5.3/§10).        #
+#                                                                             #
+# singer-sdk's _handle_max_record_age() calls drain_all(is_endofpipe=False)   #
+# directly on a wall-clock timer, bypassing the _process_state_message trigger #
+# gate entirely. So the scope gate MUST also live inside drain_all's mid-run  #
+# branch, per sink: eligible (batch_job/storage_write upsert) sinks MERGE via #
+# checkpoint(); everything else (gcs_stage/streaming_insert/overwrite) keeps  #
+# its origin/master pre_state_hook() behavior so a mid-run drain can't MERGE  #
+# an empty staging table and advance the bookmark past GCS-only data.         #
+# --------------------------------------------------------------------------- #
+def _drain_target(sinks, method="storage_write_api"):
+    """A __init__-less TargetBigQuery wired for drain_all() mid-run tests."""
+    from target_bigquery.target import TargetBigQuery
+
+    t = TargetBigQuery.__new__(TargetBigQuery)
+    t._config = {"project": "p", "dataset": "d", "method": method}
+    t._latest_state = {"bookmarks": {"A": 5}}
+    t._sinks_active = sinks
+    t.workers = []
+    t.max_parallelism = 1
+    t._delete_buffer = {}
+    t._records_since_checkpoint = 42
+    t._drain_all = MagicMock()
+    t._raise_pending_worker_error = MagicMock()
+    t._write_state_message = MagicMock()
+    t._reset_max_record_age = MagicMock()
+    return t
+
+
+def test_drain_all_non_endofpipe_ineligible_method_uses_pre_state_hook():
+    # method=gcs_stage: even a sink with merge_target set is OUT of scope. The
+    # mid-run (max-age) drain must fall back to the origin/master pre_state_hook
+    # and must NOT checkpoint (which would MERGE an empty staging table and
+    # advance the bookmark past GCS-only data). STATE is still emitted.
+    sink = _checkpoint_mock_sink(merge_target=object())
+    t = _drain_target({"A": sink}, method="gcs_stage")
+    t.drain_all(is_endofpipe=False)
+    sink.pre_state_hook.assert_called_once()
+    sink.checkpoint.assert_not_called()
+    t._write_state_message.assert_called_once()
+
+
+def test_drain_all_non_endofpipe_overwrite_sink_uses_pre_state_hook():
+    # Overwrite sink under batch_job: eligible method, but overwrite_target set
+    # (and merge_target None) => out of scope. pre_state_hook, not checkpoint.
+    sink = _checkpoint_mock_sink(overwrite_target=object())
+    t = _drain_target({"A": sink}, method="batch_job")
+    t.drain_all(is_endofpipe=False)
+    sink.pre_state_hook.assert_called_once()
+    sink.checkpoint.assert_not_called()
+    t._write_state_message.assert_called_once()
+
+
+@pytest.mark.parametrize("method", ["batch_job", "storage_write_api"])
+def test_drain_all_non_endofpipe_eligible_sink_checkpoints(method):
+    # Eligible: batch_job/storage_write upsert sink (merge_target set, no
+    # overwrite) => checkpoint() MERGEs mid-run, pre_state_hook is not used,
+    # the record counter resets, and STATE is emitted.
+    sink = _checkpoint_mock_sink(merge_target=object())
+    t = _drain_target({"A": sink}, method=method)
+    t.drain_all(is_endofpipe=False)
+    sink.checkpoint.assert_called_once()
+    sink.pre_state_hook.assert_not_called()
+    assert t._records_since_checkpoint == 0
+    t._write_state_message.assert_called_once()
+
+
+def test_drain_all_non_endofpipe_eligible_checkpoint_failure_fails_fast():
+    # Fail-fast still holds on the gated mid-run path: an eligible sink whose
+    # checkpoint() raises propagates before STATE and before the counter reset.
+    sink = _checkpoint_mock_sink(merge_target=object())
+    sink.checkpoint.side_effect = Exception("merge failed")
+    t = _drain_target({"A": sink}, method="batch_job")
+    with pytest.raises(Exception, match="merge failed"):
+        t.drain_all(is_endofpipe=False)
+    t._write_state_message.assert_not_called()
+    assert t._records_since_checkpoint == 42  # not reset
+
+
+# --------------------------------------------------------------------------- #
+# P0 (PQ-3547): a worker/load error must NEVER emit STATE.                     #
+#                                                                             #
+# The old drain_one() error branch recv()'d the worker error (consuming it)   #
+# then called drain_all(is_endofpipe=True). Inside that nested drain,         #
+# _raise_pending_worker_error found the pipe already empty and fell through   #
+# to clean_up() + _write_state_message(), emitting the advanced bookmark      #
+# BEFORE drain_one finally re-raised -> STATE advanced past a failed batch =   #
+# data loss on resume. The fix tears down worker PROCESSES ONLY               #
+# (_shutdown_workers) on the error path and never finalizes sinks or state.   #
+# --------------------------------------------------------------------------- #
+class _FakePipe:
+    """Minimal Connection stand-in. poll() returns queued booleans (then False);
+    recv() returns a fixed payload. Not a MagicMock, so poll()'s truthiness is
+    exactly what we script."""
+
+    def __init__(self, poll_results=(), recv_value=None):
+        self._poll = list(poll_results)
+        self._recv_value = recv_value
+
+    def poll(self):
+        if self._poll:
+            return self._poll.pop(0)
+        return False
+
+    def recv(self):
+        return self._recv_value
+
+
+def test_worker_error_never_emits_state_through_real_drain_path():
+    """The strongest P0 regression: drive the REAL TargetBigQuery.drain_all
+    (is_endofpipe=False) and let the REAL singer-sdk _drain_all() call the REAL
+    drain_one(), whose error poll fires. _drain_all/drain_one are NOT mocked.
+    A worker error must propagate as RuntimeError with workers torn down and
+    ZERO sink finalization / STATE emission -- the previously-emitted bookmark
+    stays the last output."""
+    from target_bigquery.target import TargetBigQuery
+
+    t = TargetBigQuery.__new__(TargetBigQuery)
+    t._config = {"project": "p", "dataset": "d", "fail_fast": True}
+    t._latest_state = {"bookmarks": {"A": 7}}  # already emitted; must not advance
+    t.max_parallelism = 1
+    # logger is a read-only classproperty in the SDK; the real one logs fine.
+    t._delete_buffer = {}
+
+    # Fake pipes: only the error pipe fires (once).
+    t.job_notification = _FakePipe([False])
+    t.log_notification = _FakePipe([False])
+    original_error = RuntimeError("record too large for any AppendRows request")
+    t.error_notification = _FakePipe([True], recv_value=(original_error, "worker load failed"))
+
+    # Fake queue + one alive worker so the real _shutdown_workers has work to do.
+    t.queue = MagicMock()
+    worker = MagicMock()
+    worker.is_alive.return_value = True
+    t.workers = [worker]
+
+    # resize_worker_pool would otherwise spawn a real thread; neutralize only it.
+    t.resize_worker_pool = MagicMock()
+
+    sink = MagicMock()
+    t._sinks_active = {"A": sink}
+
+    # Record-only spies; drain_one() and _drain_all() stay REAL.
+    t._flush_deletes = MagicMock()
+    t._write_state_message = MagicMock()
+    t._reset_max_record_age = MagicMock()
+
+    with pytest.raises(RuntimeError):
+        t.drain_all(is_endofpipe=False)
+
+    # _shutdown_workers ran on the real path: sentinel queued, worker joined, list cleared.
+    t.queue.put.assert_called_once_with(None)
+    worker.join.assert_called_once()
+    assert t.workers == []
+    # Absolutely no sink finalization or STATE emission on the error path.
+    sink.clean_up.assert_not_called()
+    sink.checkpoint.assert_not_called()
+    t._flush_deletes.assert_not_called()
+    t._write_state_message.assert_not_called()
+
+
+# --------------------------------------------------------------------------- #
+# _shutdown_workers(): worker PROCESS teardown only (no sinks/state).          #
+# --------------------------------------------------------------------------- #
+def test_shutdown_workers_sends_sentinels_joins_once_and_clears():
+    from target_bigquery.target import TargetBigQuery
+
+    t = TargetBigQuery.__new__(TargetBigQuery)
+    t.queue = MagicMock()
+    workers = [MagicMock() for _ in range(3)]
+    for w in workers:
+        w.is_alive.return_value = True
+    t.workers = list(workers)
+
+    t._shutdown_workers()
+
+    # One sentinel per alive worker.
+    assert t.queue.put.call_count == 3
+    assert all(c.args == (None,) for c in t.queue.put.call_args_list)
+    # Every worker joined exactly once (no double-join, no skipped first).
+    for w in workers:
+        w.join.assert_called_once()
+    assert t.workers == []
+
+
+def test_shutdown_workers_is_noop_safe_on_empty_list():
+    from target_bigquery.target import TargetBigQuery
+
+    t = TargetBigQuery.__new__(TargetBigQuery)
+    t.queue = MagicMock()
+    t.workers = []
+    t._shutdown_workers()  # must not raise
+    t.queue.put.assert_not_called()
+    assert t.workers == []
+
+
+# --------------------------------------------------------------------------- #
+# mid-run drain must STOP workers (sentinel) before joining (PQ-3547).         #
+#                                                                             #
+# drain_all(is_endofpipe=False) is the row-threshold / max-age checkpoint path #
+# and runs frequently (every ~batch on a data-heavy stream). The old branch    #
+# did a bare `for worker in self.workers: worker.join()` with NO stop sentinel #
+# and never cleared self.workers -- each BatchJobWorker/storage_write worker    #
+# only exits after its blocking queue.get(timeout=30.0) raises Empty, so every  #
+# checkpoint stalled ~30s per live worker (tens of minutes over a big stream).  #
+# The fix routes this branch through _shutdown_workers(), which enqueues a None #
+# sentinel per alive worker (immediate exit), joins, and clears the pool so     #
+# resize_worker_pool() re-grows it on the next records.                         #
+# --------------------------------------------------------------------------- #
+def test_drain_all_non_endofpipe_sends_stop_sentinels_before_join():
+    from target_bigquery.target import TargetBigQuery
+
+    t = TargetBigQuery.__new__(TargetBigQuery)
+    t._config = {"project": "p", "dataset": "d"}
+    t._latest_state = {"bookmarks": {"A": 5}}
+    sink = _checkpoint_mock_sink(merge_target=object())  # eligible upsert sink
+    t._sinks_active = {"A": sink}
+    t.queue = MagicMock()
+    worker = MagicMock()
+    worker.is_alive.return_value = True
+    t.workers = [worker]
+    t.max_parallelism = 1
+    t._delete_buffer = {}
+    t._records_since_checkpoint = 42
+    t._drain_all = MagicMock()
+    t._raise_pending_worker_error = MagicMock()
+    t._write_state_message = MagicMock()
+    t._reset_max_record_age = MagicMock()
+
+    t.drain_all(is_endofpipe=False)
+
+    # A stop sentinel (None) was enqueued once per alive worker, so each worker
+    # breaks out of queue.get(timeout=30.0) immediately instead of blocking ~30s
+    # for Empty. Pre-fix (bare join loop) put NO sentinel -> this assertion fails.
+    t.queue.put.assert_called_once_with(None)
+    worker.join.assert_called_once()
+    # Pool cleared so resize_worker_pool() re-grows it on the next records.
+    assert t.workers == []
+
+
+# --------------------------------------------------------------------------- #
+# P2 (PQ-3547): overwrite exclusion is RUN-LEVEL on the mid-run drain.         #
+# If ANY active sink is in overwrite mode, NO sink is checkpointed -- every    #
+# sink uses pre_state_hook() (origin/master behavior) and STATE is emitted.    #
+# --------------------------------------------------------------------------- #
+def test_drain_all_non_endofpipe_mixed_upsert_and_overwrite_none_checkpoint():
+    upsert = _checkpoint_mock_sink(merge_target=object())
+    overwrite = _checkpoint_mock_sink(overwrite_target=object())
+    t = _drain_target(OrderedDict(A=upsert, B=overwrite), method="batch_job")
+    t.drain_all(is_endofpipe=False)
+    # Run-level gate: coexisting overwrite target excludes the whole run.
+    upsert.checkpoint.assert_not_called()
+    overwrite.checkpoint.assert_not_called()
+    upsert.pre_state_hook.assert_called_once()
+    overwrite.pre_state_hook.assert_called_once()
+    t._write_state_message.assert_called_once()  # STATE still emitted
+
+
+# --------------------------------------------------------------------------- #
+# Batch Job destination resolves self.table.as_ref() per enqueue, so a Job     #
+# enqueued BEFORE a checkpoint carries the generation-1 table and one enqueued #
+# AFTER carries generation-2 (rotated staging table). Uses the __new__-based   #
+# no-BQ sink helper + a recording queue; the MERGE and staging-table creation  #
+# inside checkpoint() are stubbed (no real infra), and rotation is emulated by #
+# swapping self.table -- faithful to how checkpoint() rotates staging.         #
+# --------------------------------------------------------------------------- #
+def test_batch_job_destination_before_and_after_checkpoint_rotation(monkeypatch):
+    from target_bigquery.batch_job import BigQueryBatchJobSink
+    from target_bigquery.core import BigQueryTable, IngestionStrategy, Compressor, ParType
+
+    opts = {
+        "project": "p", "dataset": "d", "jsonschema": {"properties": {}},
+        "transforms": {}, "ingestion_strategy": IngestionStrategy.FIXED,
+    }
+    gen1 = BigQueryTable(name="orders__gen1_1", **opts)
+    gen2 = BigQueryTable(name="orders__gen2_1", **opts)
+
+    s = BigQueryBatchJobSink.__new__(BigQueryBatchJobSink)
+    s.client = MagicMock()
+    s.merge_target = BigQueryTable(name="orders", **opts)
+    s.table = gen1
+    s.buffer = Compressor()
+    s.global_par_typ = ParType.THREAD
+    s.increment_jobs_enqueued = lambda: None
+
+    enqueued = []
+    s.global_queue = MagicMock()
+    s.global_queue.put.side_effect = lambda job: enqueued.append(job)
+
+    # REAL process_batch resolves self.table.as_ref() at enqueue time.
+    s.process_batch({})  # BEFORE checkpoint -> generation 1
+
+    # Stub the destructive halves of checkpoint(): MERGE issues a query; the
+    # staging rotation swaps self.table to generation 2 (no real BQ table).
+    monkeypatch.setattr(
+        type(s), "_merge_staging_into_target", lambda self: self.client.query("MERGE")
+    )
+    monkeypatch.setattr(
+        type(s), "_new_staging_table", lambda self: setattr(self, "table", gen2)
+    )
+    s.checkpoint()
+
+    s.process_batch({})  # AFTER checkpoint -> generation 2
+
+    assert len(enqueued) == 2
+    assert enqueued[0].table == gen1.as_ref()
+    assert enqueued[1].table == gen2.as_ref()
+    assert enqueued[0].table != enqueued[1].table
+
+
+# --------------------------------------------------------------------------- #
+# commit_streams(): a partial batch-commit failure must ABORT the checkpoint   #
+# (PQ-3547). batch_commit_write_streams() reports per-stream commit failures   #
+# in response.stream_errors. commit_streams() runs BEFORE the MERGE in         #
+# checkpoint()/clean_up()/pre_state_hook(); if it only logs those errors and   #
+# returns, the caller proceeds to MERGE and emits STATE -> the bookmark        #
+# advances past data that was never committed = silent loss. It must RAISE.    #
+# (Only the batch_mode/application-stream path is hardened; the `_default`     #
+# path filters open_streams to empty and never calls batch_commit_write_streams.)#
+# --------------------------------------------------------------------------- #
+def _commit_streams_sink(stream_errors):
+    """A storage_write sink (no __init__/BQ) whose stubbed committer returns a
+    batch_commit_write_streams response with the given `stream_errors`, and one
+    open application (non-`_default`) stream ready to commit."""
+    from target_bigquery.storage_write import BigQueryStorageWriteDenormalizedSink as SW
+
+    s = SW.__new__(SW)
+    s.logger = MagicMock()  # set in Sink.__init__ (bypassed by __new__)
+    s._credentials = MagicMock()
+    s.parent = "projects/p/datasets/d/tables/salesinvoicelines__gen1_1"
+    # No pending stream payloads to drain: poll() returns False immediately.
+    s.stream_notification = _FakePipe([False])
+    stream = MagicMock()  # an application stream; stream.close() must be called
+    s.open_streams = {("app_write_stream", stream)}
+
+    committer = MagicMock()
+    response = MagicMock()
+    response.stream_errors = stream_errors
+    committer.batch_commit_write_streams.return_value = response
+    return s, committer, stream
+
+
+def test_commit_streams_raises_on_batch_commit_stream_errors():
+    s, committer, stream = _commit_streams_sink(stream_errors=["stream commit failed"])
+    with patch(
+        "target_bigquery.storage_write.storage_client_factory", return_value=committer
+    ):
+        with pytest.raises(RuntimeError):
+            s.commit_streams()
+    # The stream was finalized/closed and a commit was attempted before the raise.
+    stream.close.assert_called_once()
+    committer.finalize_write_stream.assert_called_once()
+    committer.batch_commit_write_streams.assert_called_once()
+
+
+def test_commit_streams_does_not_raise_when_no_stream_errors():
+    s, committer, stream = _commit_streams_sink(stream_errors=[])
+    with patch(
+        "target_bigquery.storage_write.storage_client_factory", return_value=committer
+    ):
+        s.commit_streams()  # clean commit -> must not raise
+    committer.batch_commit_write_streams.assert_called_once()
+    assert s.open_streams == set()  # reset after a successful commit
