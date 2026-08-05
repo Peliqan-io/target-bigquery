@@ -46,6 +46,12 @@ class FakeStream:
         self._closed = True
 
 
+def fake_client():
+    """Stand-in gRPC write client; transport.close() is a no-op. Cache entries
+    are now (name, stream, dispatch, client) 4-tuples (PQ-3820)."""
+    return SimpleNamespace(transport=SimpleNamespace(close=lambda: None))
+
+
 class FakeDispatch:
     """Dispatcher returning queued futures, recording every re-sent request."""
 
@@ -73,7 +79,7 @@ def make_worker(first_future, job, dispatch, stream=None):
     worker.logger = sw.logger
     worker.error_notifier = FakePipe()
     worker.job_notifier = FakePipe()
-    worker.cache = {PARENT: ("stream-path", stream or FakeStream(), dispatch)}
+    worker.cache = {PARENT: ("stream-path", stream or FakeStream(), dispatch, fake_client())}
     worker.awaiting = [(first_future, job, "request-payload", 1)]
     return worker
 
@@ -109,8 +115,9 @@ def test_timeout_closes_stream_and_resends_on_fresh_one(monkeypatch):
     )
     monkeypatch.setattr(sw, "fresh_storage_client", lambda creds: "client")
     worker.credentials = None
+    worker._assert_target_table_exists = lambda parent: None  # bypass PQ-3820 preflight
     worker.get_stream_components = (
-        lambda client, job: ("new-path", FakeStream(), new_dispatch)
+        lambda client, job: ("new-path", FakeStream(), new_dispatch, client)
     )
     worker.wait(drain=True)
     assert old_stream._closed is True  # wedged stream declared dead

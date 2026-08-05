@@ -54,6 +54,11 @@ WORKER_CAPACITY_FACTOR = 5
 """Jobs enqueued must exceed the number of active workers times this number."""
 WORKER_CREATION_MIN_INTERVAL = 5
 """Minimum time between worker creation attempts."""
+MAX_RESPAWNS_WITHOUT_PROGRESS = 25
+"""PQ-3820 backstop: if the pool respawns this many workers while jobs are
+pending and NOT a single job completes in between, the target is unreachable
+(e.g. its table was deleted mid-sync) — stop respawning and abort instead of
+looping forever."""
 
 
 class TargetBigQuery(Target):
@@ -399,6 +404,9 @@ class TargetBigQuery(Target):
         # skip that final bookmark. This flag lets the boundary drain fire when a
         # STATE is pending even though no records have accrued (PQ-3547).
         self._state_pending = False
+        # PQ-3820: counts worker respawns since the last completed job. Reset in
+        # drain_one on every completion ping; tripped in resize_worker_pool.
+        self._respawns_since_progress = 0
 
     def increment_jobs_enqueued(self) -> None:
         """Increment the number of jobs enqueued."""
@@ -475,10 +483,25 @@ class TargetBigQuery(Target):
             worker.join()  # Wait for the worker to terminate. This should be a no-op.
             self.logger.info("Culling terminated worker %s", worker.ext_id)
         while self.add_worker_predicate or not self.workers:
+            # PQ-3820 backstop: if we keep respawning while work is pending but
+            # nothing ever completes, the target is unreachable (e.g. its table
+            # was deleted mid-sync). Give up instead of looping forever.
+            if self._respawns_since_progress >= MAX_RESPAWNS_WITHOUT_PROGRESS:
+                raise RuntimeError(
+                    f"target-bigquery: {self._respawns_since_progress} worker "
+                    f"respawns with no successful append and jobs still pending — "
+                    f"target appears permanently unavailable (e.g. table/dataset "
+                    f"deleted). Aborting sync."
+                )
             worker = self.worker_factory()
             worker.start()
             self.workers.append(worker)
             worker_spawned = True
+            # Only count respawns that happen while work is pending; idle
+            # respawns (worker self-terminated waiting for a slow tap) are not
+            # failures and must not trip the backstop.
+            if self._jobs_enqueued > 0:
+                self._respawns_since_progress += 1
             self.logger.info("Adding worker %s", worker.ext_id)
             self._last_worker_creation = time.time()
         if worker_spawned:
@@ -671,6 +694,25 @@ class TargetBigQuery(Target):
             worker.join()
         self.workers.clear()
 
+    def _pump_backpressure(self) -> None:
+        """Called from a sink's enqueue backpressure loop (process_batch) while
+        the job queue is full. Unlike drain_one it does NOT drain sinks (which
+        would re-enter process_batch), so it is re-entrancy safe. It respawns
+        dead workers so a stalled queue can drain / the respawn budget can trip,
+        and raises immediately on a reported worker error — so a permanently
+        failing sync (e.g. its table was deleted) terminates instead of spinning
+        in the backpressure loop forever (PQ-3820)."""
+        self.resize_worker_pool()
+        while self.job_notification.poll():
+            ext_id = self.job_notification.recv()
+            self.worker_pings[ext_id] = time.time()
+            self._jobs_enqueued -= 1
+            self._respawns_since_progress = 0
+        if self.error_notification.poll() and self.config.get("fail_fast", True):
+            e, msg = self.error_notification.recv()
+            self.logger.error("Worker error during enqueue backpressure; terminating: %s" % msg)
+            raise RuntimeError(msg) from e
+
     def drain_one(self, sink: Sink) -> None:  # type: ignore
         """Drain a sink. Includes a hook to manage the worker pool and notifications."""
         #self.logger.info(f"Jobs queued : {self.queue.qsize()} | Max nb jobs queued : {os.cpu_count() * 4} | Nb workers : {len(self.workers)} | Max nb workers : {os.cpu_count() * 2}")
@@ -679,6 +721,7 @@ class TargetBigQuery(Target):
             ext_id = self.job_notification.recv()
             self.worker_pings[ext_id] = time.time()
             self._jobs_enqueued -= 1
+            self._respawns_since_progress = 0  # a completed job = progress (PQ-3820)
         while self.log_notification.poll():
             msg = self.log_notification.recv()
             self.logger.info(msg)
