@@ -420,6 +420,12 @@ class BaseBigQuerySink(BatchSink):
         self._new_staging_table()
         self._on_staging_rotated()
 
+    def activate_version(self, new_version: int) -> None:
+        self.logger.info(
+            "ACTIVATE_VERSION received for %s: version %s", self.stream_name, new_version
+        )
+        self._pending_activate_version = new_version
+
     @property
     def table_name(self) -> str:
         """Returns the table name, optionally prefixed with table_name_prefix."""
@@ -629,8 +635,29 @@ class BaseBigQuerySink(BatchSink):
         ).result()
 
     def clean_up(self) -> None:
-        """Finalize at end-of-pipe: MERGE (or overwrite) staging into target,
-        then tear down. Unlike checkpoint(), this is the terminal step."""
+        """Finalize at end-of-pipe: publish a versioned run, or MERGE/overwrite
+        staging into the target, then tear down. Unlike checkpoint(), terminal."""
+        if self.activate_version_target is not None:
+            live, staging = self.activate_version_target, self.table
+            self.table, self.activate_version_target = live, None
+            version, self._pending_activate_version = self._pending_activate_version, None
+            if version is None:
+                self.logger.warning(
+                    "Versioned run for %s ended without ACTIVATE_VERSION; discarding"
+                    " staged rows in %s and leaving the live table unchanged.",
+                    self.stream_name,
+                    staging.name,
+                )
+            else:
+                self._replace_table_from(staging, live)
+                self.logger.info(
+                    "ACTIVATE_VERSION: %s replaced from staging at version %s",
+                    self.table_name,
+                    version,
+                )
+            self.client.delete_table(staging.as_ref(), not_found_ok=True)
+            return
+
         if self.merge_target is not None:
             if self._staging_open:
                 # We must merge the temp table into the target table.
