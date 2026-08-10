@@ -243,7 +243,7 @@ def test_versioned_and_unversioned_streams_coexist(recorder):
 # --------------------------------------------------------------------------- #
 # Overwrite path (B1-B3 fix): uses _replace_table_from
 # --------------------------------------------------------------------------- #
-def test_overwrite_path_uses_replace(recorder, monkeypatch):
+def test_overwrite_path_uses_replace(recorder):
     """The overwrite path must use _replace_table_from, not DROP+CTAS."""
     overwrite_config = {**CONFIG, "upsert": False, "overwrite": True}
     target = TargetBigQuery(config=overwrite_config)
