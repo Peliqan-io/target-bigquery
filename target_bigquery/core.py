@@ -638,9 +638,15 @@ class BaseBigQuerySink(BatchSink):
         """Finalize at end-of-pipe: publish a versioned run, or MERGE/overwrite
         staging into the target, then tear down. Unlike checkpoint(), terminal."""
         if self.activate_version_target is not None:
-            live, staging = self.activate_version_target, self.table
-            self.table, self.activate_version_target = live, None
-            version, self._pending_activate_version = self._pending_activate_version, None
+            live = self.activate_version_target
+            staging = self.table
+            version = self._pending_activate_version
+
+            # Restore self.table to the live table before any cleanup.
+            self.table = live
+            self.activate_version_target = None
+            self._pending_activate_version = None
+
             if version is None:
                 self.logger.warning(
                     "Versioned run for %s ended without ACTIVATE_VERSION; discarding"
@@ -655,6 +661,7 @@ class BaseBigQuerySink(BatchSink):
                     self.table_name,
                     version,
                 )
+
             self.client.delete_table(staging.as_ref(), not_found_ok=True)
             return
 
