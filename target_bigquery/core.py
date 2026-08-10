@@ -584,6 +584,32 @@ class BaseBigQuerySink(BatchSink):
         self._merge_staging_into_target()
         self._staging_open = False
 
+    def _replace_table_from(self, source: "BigQueryTable", dest: "BigQueryTable") -> None:
+        """Atomically replace *dest*'s contents with everything in *source*.
+
+        Uses a query job with WRITE_TRUNCATE: creation, truncation, and append
+        commit as one atomic update — the table object (and its description)
+        survives, so views and baserow's fetch_singer_schema keep working.
+        Partitioning/clustering are restated explicitly because a query-job
+        destination does not infer them from the existing table."""
+        job_config = bigquery.QueryJobConfig(
+            destination=dest.as_ref(),
+            write_disposition=bigquery.WriteDisposition.WRITE_TRUNCATE,
+        )
+        partition_grain: str = self.config.get("partition_granularity")
+        if partition_grain:
+            job_config.time_partitioning = TimePartitioning(
+                type_=PARTITION_STRATEGY[partition_grain.upper()],
+                field="_sdc_batched_at",
+            )
+        if self.key_properties and self.config.get("cluster_on_key_properties", False):
+            job_config.clustering_fields = self.key_properties[:4]
+        else:
+            job_config.clustering_fields = ["_sdc_batched_at"]
+        self.client.query(
+            f"SELECT * FROM {source.get_escaped_name()}", job_config=job_config
+        ).result()
+
     def clean_up(self) -> None:
         """Finalize at end-of-pipe: MERGE (or overwrite) staging into target,
         then tear down. Unlike checkpoint(), this is the terminal step."""
@@ -595,17 +621,10 @@ class BaseBigQuerySink(BatchSink):
             self.table = self.merge_target
             self.merge_target = None
         elif self.overwrite_target is not None:
-            # We must overwrite the target table with the temp table.
-            # Do it in a transaction to avoid partial writes.
-            target = self.overwrite_target.as_table()
-            self.client.query(
-                f"DROP TABLE IF EXISTS {self.overwrite_target.get_escaped_name()}; CREATE TABLE"
-                f" {self.overwrite_target.get_escaped_name()} AS SELECT * FROM"
-                f" {self.table.get_escaped_name()}; DROP TABLE IF EXISTS"
-                f" {self.table.get_escaped_name()};"
-            ).result()
-            self.table = self.merge_target
-            self.merge_target = None
+            self._replace_table_from(self.table, self.overwrite_target)
+            self.client.delete_table(self.table.as_ref(), not_found_ok=True)
+            self.table = self.overwrite_target
+            self.overwrite_target = None
 
 
 class Denormalized:
