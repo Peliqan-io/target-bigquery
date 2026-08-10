@@ -328,9 +328,8 @@ class BaseBigQuerySink(BatchSink):
         # If the stream is marked for one of these strategies, we create a temporary table instead
         # and merge or overwrite the target table with the temporary table after the ingest.
         self._staging_open = False
-        self.activate_version_target: Optional[BigQueryTable] = None
-        self._pending_activate_version: Optional[int] = None
-        self._version_decided = False
+        self.activate_version_target = None
+        self._pending_activate_version = None
         if (
             key_properties
             and self.ingestion_strategy is IngestionStrategy.DENORMALIZED
@@ -409,9 +408,8 @@ class BaseBigQuerySink(BatchSink):
         self, record: Dict[str, Any], message: Dict[str, Any], context: Dict[str, Any]
     ) -> None:
         super()._add_sdc_metadata_to_record(record, message, context)
-        if self._version_decided:
+        if self.activate_version_target is not None:
             return
-        self._version_decided = True
         if record.get("_sdc_table_version") is None or self.overwrite_target is not None:
             return
         self.activate_version_target = copy(self.table)
