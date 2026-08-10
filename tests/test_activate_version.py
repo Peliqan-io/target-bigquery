@@ -216,6 +216,81 @@ def test_empty_response_without_activate_version_keeps_table(recorder):
 
 
 # --------------------------------------------------------------------------- #
+# Multi-batch: every batch must reach the same staging generation
+# --------------------------------------------------------------------------- #
+def test_versioned_multi_batch_uses_one_staging_generation(recorder, monkeypatch):
+    """A versioned run spanning several batches must write them all into ONE
+    staging table, and swap that same table onto the live one.
+
+    A versioned sink clears merge_target, which makes checkpoint() and
+    ensure_staging() no-ops -- so the generation opened on record #1 stays
+    pinned for the whole run and no batch can ever land in a dropped one.
+    """
+    from target_bigquery.batch_job import BigQueryBatchJobDenormalizedSink
+
+    targeted = []
+    monkeypatch.setattr(
+        BigQueryBatchJobDenormalizedSink,
+        "process_batch",
+        lambda self, context: targeted.append(self.table.name),
+    )
+
+    lines = [schema_line("deals")]
+    lines += [
+        record_line("deals", {"id": i, "value": f"v{i}"}, version=100) for i in range(7)
+    ]
+    lines += [state_line("deals"), activate_line("deals", 100)]
+
+    target = TargetBigQuery(config={**CONFIG, "batch_size": 2})
+    target._process_lines(io.StringIO("\n".join(lines) + "\n"))
+    target.drain_all(is_endofpipe=True)
+
+    assert len(targeted) > 1, f"expected several batches, got {targeted}"
+    assert len(set(targeted)) == 1, f"batches split across generations: {set(targeted)}"
+    assert recorder.is_staging(targeted[0]), f"batches went to {targeted[0]}, not staging"
+
+    staging = [n for n in recorder.created if recorder.is_staging(n)]
+    assert len(staging) == 1, f"expected 1 staging table, got {staging}"
+
+    # ...and the swap published that very table.
+    assert len(recorder.replaced) == 1
+    source, dest = recorder.replaced[0]
+    assert source == targeted[0]
+    assert dest == "deals"
+
+
+def test_unversioned_multi_batch_still_rotates_generations(recorder, monkeypatch):
+    """Guard the inverse: an unversioned merge sink keeps PQ-3547 behaviour,
+    where a checkpoint closes a generation and the next batch opens a new one."""
+    from target_bigquery.batch_job import BigQueryBatchJobDenormalizedSink
+
+    targeted = []
+    monkeypatch.setattr(
+        BigQueryBatchJobDenormalizedSink,
+        "process_batch",
+        lambda self, context: targeted.append(self.table.name),
+    )
+
+    lines = [schema_line("deals")]
+    lines += [record_line("deals", {"id": i, "value": f"v{i}"}) for i in range(4)]
+    lines.append(state_line("deals"))
+    lines += [record_line("deals", {"id": i, "value": f"w{i}"}) for i in range(4, 8)]
+    lines.append(state_line("deals"))
+
+    # threshold 0 => every STATE boundary checkpoints (MERGE + drop generation)
+    target = TargetBigQuery(
+        config={**CONFIG, "batch_size": 2, "checkpoint_row_threshold": 0}
+    )
+    target._process_lines(io.StringIO("\n".join(lines) + "\n"))
+    target.drain_all(is_endofpipe=True)
+
+    assert len(set(targeted)) > 1, (
+        f"unversioned sink should rotate generations across checkpoints, got {set(targeted)}"
+    )
+    assert recorder.replaced == [], "an unversioned stream must never swap"
+
+
+# --------------------------------------------------------------------------- #
 # Multi-stream: versioned + unversioned coexist
 # --------------------------------------------------------------------------- #
 def test_versioned_and_unversioned_streams_coexist(recorder):
