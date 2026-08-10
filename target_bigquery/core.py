@@ -671,6 +671,15 @@ class BaseBigQuerySink(BatchSink):
             self.table = self.overwrite_target
             self.overwrite_target = None
 
+        if self._pending_activate_version is not None:
+            self._pending_activate_version = None
+            self.client.query(
+                f"TRUNCATE TABLE {self.table.get_escaped_name()}"
+            ).result()
+            self.logger.info(
+                "ACTIVATE_VERSION: %s cleared (empty response)", self.table_name
+            )
+
 
 class Denormalized:
     """This class provides common overrides for denormalized sinks and should be subclassed
