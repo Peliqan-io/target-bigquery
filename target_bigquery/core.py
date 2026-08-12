@@ -328,6 +328,8 @@ class BaseBigQuerySink(BatchSink):
         # If the stream is marked for one of these strategies, we create a temporary table instead
         # and merge or overwrite the target table with the temporary table after the ingest.
         self._staging_open = False
+        self.activate_version_target = None
+        self._pending_activate_version = None
         if (
             key_properties
             and self.ingestion_strategy is IngestionStrategy.DENORMALIZED
@@ -401,6 +403,26 @@ class BaseBigQuerySink(BatchSink):
         elif dedupe_before_upsert_selection:
             dedupe_before_upsert_candidate = True
         return dedupe_before_upsert_candidate
+
+    def _add_sdc_metadata_to_record(
+        self, record: Dict[str, Any], message: Dict[str, Any], context: Dict[str, Any]
+    ) -> None:
+        super()._add_sdc_metadata_to_record(record, message, context)
+        if self.activate_version_target is not None:
+            return
+        if record.get("_sdc_table_version") is None or self.overwrite_target is not None:
+            return
+        self.activate_version_target = copy(self.table)
+        self.merge_target = None
+        self._staging_open = False
+        self._new_staging_table()
+        self._on_staging_rotated()
+
+    def activate_version(self, new_version: int) -> None:
+        self.logger.info(
+            "ACTIVATE_VERSION received for %s: version %s", self.stream_name, new_version
+        )
+        self._pending_activate_version = new_version
 
     @property
     def table_name(self) -> str:
@@ -584,9 +606,63 @@ class BaseBigQuerySink(BatchSink):
         self._merge_staging_into_target()
         self._staging_open = False
 
+    def _replace_table_from(self, source: "BigQueryTable", dest: "BigQueryTable") -> None:
+        """Atomically replace *dest*'s contents with everything in *source*.
+
+        Uses a query job with WRITE_TRUNCATE: creation, truncation, and append
+        commit as one atomic update — the table object (and its description)
+        survives, so views and baserow's fetch_singer_schema keep working.
+        Partitioning/clustering are restated explicitly because a query-job
+        destination does not infer them from the existing table."""
+        job_config = bigquery.QueryJobConfig(
+            destination=dest.as_ref(),
+            write_disposition=bigquery.WriteDisposition.WRITE_TRUNCATE,
+        )
+        partition_grain: str = self.config.get("partition_granularity")
+        if partition_grain:
+            job_config.time_partitioning = TimePartitioning(
+                type_=PARTITION_STRATEGY[partition_grain.upper()],
+                field="_sdc_batched_at",
+            )
+        if self.key_properties and self.config.get("cluster_on_key_properties", False):
+            job_config.clustering_fields = self.key_properties[:4]
+        else:
+            job_config.clustering_fields = ["_sdc_batched_at"]
+        self.client.query(
+            f"SELECT * FROM {source.get_escaped_name()}", job_config=job_config
+        ).result()
+
     def clean_up(self) -> None:
-        """Finalize at end-of-pipe: MERGE (or overwrite) staging into target,
-        then tear down. Unlike checkpoint(), this is the terminal step."""
+        """Finalize at end-of-pipe: publish a versioned run, or MERGE/overwrite
+        staging into the target, then tear down. Unlike checkpoint(), terminal."""
+        if self.activate_version_target is not None:
+            live = self.activate_version_target
+            staging = self.table
+            version = self._pending_activate_version
+
+            # Restore self.table to the live table before any cleanup.
+            self.table = live
+            self.activate_version_target = None
+            self._pending_activate_version = None
+
+            if version is None:
+                self.logger.warning(
+                    "Versioned run for %s ended without ACTIVATE_VERSION; discarding"
+                    " staged rows in %s and leaving the live table unchanged.",
+                    self.stream_name,
+                    staging.name,
+                )
+            else:
+                self._replace_table_from(staging, live)
+                self.logger.info(
+                    "ACTIVATE_VERSION: %s replaced from staging at version %s",
+                    self.table_name,
+                    version,
+                )
+
+            self.client.delete_table(staging.as_ref(), not_found_ok=True)
+            return
+
         if self.merge_target is not None:
             if self._staging_open:
                 # We must merge the temp table into the target table.
@@ -595,17 +671,19 @@ class BaseBigQuerySink(BatchSink):
             self.table = self.merge_target
             self.merge_target = None
         elif self.overwrite_target is not None:
-            # We must overwrite the target table with the temp table.
-            # Do it in a transaction to avoid partial writes.
-            target = self.overwrite_target.as_table()
+            self._replace_table_from(self.table, self.overwrite_target)
+            self.client.delete_table(self.table.as_ref(), not_found_ok=True)
+            self.table = self.overwrite_target
+            self.overwrite_target = None
+
+        if self._pending_activate_version is not None:
+            self._pending_activate_version = None
             self.client.query(
-                f"DROP TABLE IF EXISTS {self.overwrite_target.get_escaped_name()}; CREATE TABLE"
-                f" {self.overwrite_target.get_escaped_name()} AS SELECT * FROM"
-                f" {self.table.get_escaped_name()}; DROP TABLE IF EXISTS"
-                f" {self.table.get_escaped_name()};"
+                f"TRUNCATE TABLE {self.table.get_escaped_name()}"
             ).result()
-            self.table = self.merge_target
-            self.merge_target = None
+            self.logger.info(
+                "ACTIVATE_VERSION: %s cleared (empty response)", self.table_name
+            )
 
 
 class Denormalized:
