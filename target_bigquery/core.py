@@ -18,6 +18,7 @@ import sys
 import time
 import traceback
 import unicodedata
+import uuid
 from abc import ABC, abstractmethod
 
 try:
@@ -320,6 +321,7 @@ class BaseBigQuerySink(BatchSink):
         self.table = BigQueryTable(name=self.table_name, **opts)
         self._staging_opts = opts
         self._staging_seq = 0
+        self._staging_nonce = uuid.uuid4().hex[:8]
         self.create_target(key_properties=key_properties)
         self.update_schema()
         self.merge_target: Optional[BigQueryTable] = None
@@ -499,9 +501,14 @@ class BaseBigQuerySink(BatchSink):
 
         Used at init (first staging table) and by checkpoint() to rotate a new
         temp in after each mid-run MERGE, so subsequent records for this stream
-        keep staging safely. A monotonic seq avoids same-second name clashes."""
+        keep staging safely. A monotonic seq avoids same-second name clashes
+        within one sink; _staging_nonce keeps two concurrent syncs of the same
+        connection apart."""
         self._staging_seq += 1
-        name = f"{self.table_name}__{int(time.time())}_{self._staging_seq}"
+        name = (
+            f"{self.table_name}__{int(time.time())}"
+            f"_{self._staging_seq}_{self._staging_nonce}"
+        )
         self.table = BigQueryTable(name=name, **self._staging_opts)
         self.table.create_table(
             self.client,
@@ -520,10 +527,17 @@ class BaseBigQuerySink(BatchSink):
     def _merge_staging_into_target(self) -> None:
         """Dedupe + MERGE the current temp table into merge_target. Raises on
         failure — never drops the temp, never swallows (PQ-3547: a failed MERGE
-        must not advance the bookmark or silently lose the staged batch)."""
+        must not advance the bookmark or silently lose the staged batch).
+
+        The staging table is dropped by a separate delete_table() call, NOT by a
+        DROP statement inside the query. client.query() defaults to
+        job_retry=DEFAULT_JOB_RETRY, and on a retriable job failure it
+        re-submits the whole SQL as a NEW job. A bundled DROP made that re-run
+        fail with "Table <staging> was not found". What stays in the job is
+        idempotent (CREATE OR REPLACE + key-based MERGE), so a re-run is safe."""
         target = self.merge_target.as_table()
         date_columns = ["_sdc_extracted_at", "_sdc_received_at"]
-        tmp, ctas_tmp = None, "SELECT 1 AS _no_op"
+        tmp, ctas_tmp = None, None
         if self._is_dedupe_before_upsert_candidate():
             # We can't use MERGE with a non-unique key, so we need to dedupe the temp table into
             # a _SESSION scoped intermediate table.
@@ -546,12 +560,27 @@ class BaseBigQuerySink(BatchSink):
             f"VALUES ({', '.join(f'source.`{f.name}`' for f in target.schema)})"
         )
         merge_sql = (
-            f"{ctas_tmp}; {merge_clause} "
+            f"{merge_clause} "
             f"WHEN MATCHED THEN {update_clause} "
-            f"WHEN NOT MATCHED THEN {insert_clause}; "
-            f"DROP TABLE IF EXISTS {self.table.get_escaped_name()};"
+            f"WHEN NOT MATCHED THEN {insert_clause}"
         )
+        if ctas_tmp is not None:
+            merge_sql = f"{ctas_tmp}; {merge_sql};"
         self.client.query(merge_sql).result()
+        self._drop_staging_table()
+
+    def _drop_staging_table(self) -> None:
+        """Best-effort drop of the merged staging table. The MERGE has already
+        committed, so a failed drop must not fail the sync. Leaked generations
+        expire within a day via _new_staging_table's expiry setting."""
+        try:
+            self.client.delete_table(self.table.as_ref(), not_found_ok=True)
+        except Exception as exc:
+            self.logger.warning(
+                "Could not drop merged staging table %s (it expires within a day): %r",
+                self.table.name,
+                exc,
+            )
 
     def ensure_staging(self) -> None:
         """Open a staging generation if none is open, right before a batch is
@@ -573,8 +602,8 @@ class BaseBigQuerySink(BatchSink):
 
     def checkpoint(self) -> None:
         """Mid-run: MERGE the open staging generation into the real table and
-        close it (the MERGE SQL drops the staging table). No successor is
-        created -- the next batch with actual records reopens one lazily via
+        close it (the staging table is dropped after the MERGE commits). No
+        successor is created -- the next batch with actual records reopens one via
         ensure_staging(). No-op when nothing is staged, so finished streams
         cost nothing on later drains. Callers must have run the per-method
         durability barrier first (workers joined, appends resolved, fallback
