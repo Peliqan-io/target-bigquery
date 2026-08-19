@@ -52,6 +52,12 @@ if TYPE_CHECKING:
     from target_bigquery.target import TargetBigQuery
 
 
+# Marker prefix for Peliqan temporary/staging tables. Any table whose name starts
+# with this is an intermediate table created during a load (merge/overwrite) and
+# must be excluded from schema discovery and cleaned up by the Peliqan backend.
+TEMP_TABLE_MARKER = "pqtemp__"
+
+
 class IngestionStrategy(Enum):
     FIXED = "fixed-schema"
     DENORMALIZED = "denormalized-schema"
@@ -523,7 +529,9 @@ class BaseBigQuerySink(BatchSink):
         temp in after each mid-run MERGE, so subsequent records for this stream
         keep staging safely. A monotonic seq avoids same-second name clashes."""
         self._staging_seq += 1
-        name = f"{self.table_name}__{int(time.time())}_{self._staging_seq}"
+        # pqtemp__ marker (PQ-3356): keeps staging tables out of Peliqan schema
+        # discovery and lets the backend clean up any orphaned staging table.
+        name = f"{TEMP_TABLE_MARKER}{self.table_name}__{int(time.time())}_{self._staging_seq}"
         self.table = BigQueryTable(name=name, **self._staging_opts)
         self.table.create_table(
             self.client,
