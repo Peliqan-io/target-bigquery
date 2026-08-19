@@ -699,8 +699,18 @@ class Denormalized:
         reraise=True,
     )
     def update_schema(self: BaseBigQuerySink) -> None:
-        """Update the target schema."""
-        table = self.table.as_table()
+        """Add columns the tap now sends that the live BigQuery table lacks.
+
+        The diff base MUST come from BigQuery, not from `as_table()`. `as_table()`
+        builds a Table client-side out of this same jsonschema, so diffing against
+        it compares the tap's schema with itself, never finds a gap, and never
+        ALTERs -- while the MERGE built from that schema goes on to reference the
+        missing column and dies with "Name <col> not found inside target" (PQ-3118).
+
+        Fetching the live table also makes the update safe in the other direction:
+        the field mask replaces the schema wholesale, so a client-side base would
+        drop any column BigQuery has but the tap no longer sends."""
+        table = self.client.get_table(self.table.as_ref())
         current_schema = table.schema[:]
         mut_schema = table.schema[:]
         for expected_field in self.table.get_resolved_schema(self.apply_transforms):
