@@ -207,13 +207,19 @@ class BigQueryTable:
             try:
                 self._table = client.get_table(self.as_ref())
             except NotFound:
-                self._table = client.create_table(
-                    self.as_table(
-                        apply_transforms and self.ingestion_strategy != IngestionStrategy.FIXED,
-                        **kwargs["table"],
-                    ),
-                    exists_ok=True,
+                # Labels are applied to the built table rather than passed through
+                # as_table: that method is @cache'd on its kwargs, so a dict value
+                # would raise "unhashable type" there. They are also not part of the
+                # table's identity, so they have no business in the cache key.
+                table_options = dict(kwargs["table"])
+                labels = table_options.pop("labels", None)
+                table = self.as_table(
+                    apply_transforms and self.ingestion_strategy != IngestionStrategy.FIXED,
+                    **table_options,
                 )
+                if labels:
+                    table.labels = labels
+                self._table = client.create_table(table, exists_ok=True)
                 # Wait for eventual consistency
                 time.sleep(5)
         return self._dataset, self._table
