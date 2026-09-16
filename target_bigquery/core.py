@@ -336,6 +336,7 @@ class BaseBigQuerySink(BatchSink):
         self._staging_open = False
         self.activate_version_target = None
         self._pending_activate_version = None
+        self._version_published = False
         if (
             key_properties
             and self.ingestion_strategy is IngestionStrategy.DENORMALIZED
@@ -414,7 +415,7 @@ class BaseBigQuerySink(BatchSink):
         self, record: Dict[str, Any], message: Dict[str, Any], context: Dict[str, Any]
     ) -> None:
         super()._add_sdc_metadata_to_record(record, message, context)
-        if self.activate_version_target is not None:
+        if self.activate_version_target is not None or self._version_published:
             return
         if record.get("_sdc_table_version") is None or self.overwrite_target is not None:
             return
@@ -614,6 +615,46 @@ class BaseBigQuerySink(BatchSink):
         self._merge_staging_into_target()
         self._staging_open = False
 
+    def finalize_version(self) -> None:
+        """Publish a completed versioned (FULL_TABLE) stream: swap its staging
+        table onto the live table and drop the staging table.
+
+        Called at the first drain boundary after the stream's ACTIVATE_VERSION
+        (PQ-4216), so staging lives for the length of one stream instead of the
+        whole run. Staging tables carry a 24h expiry, so a swap deferred to
+        end-of-pipe fails on any run longer than that. clean_up() still calls
+        this for a stream whose ACTIVATE_VERSION lands after the last drain.
+
+        No-op until both the staging table and the version are known. Callers
+        must have run the per-method durability barrier first (workers joined,
+        appends resolved, fallback jobs awaited) -- same contract as
+        checkpoint().
+        """
+        if self.activate_version_target is None or self._pending_activate_version is None:
+            return
+        live = self.activate_version_target
+        staging = self.table
+        version = self._pending_activate_version
+
+        # Point the sink back at the live table before the swap. Any record that
+        # arrives after the version is published then appends straight to the
+        # published table (matching target-postgres) rather than into a fresh
+        # staging table that nothing would consume. _version_published keeps
+        # _add_sdc_metadata_to_record from re-opening a versioned generation.
+        self.table = live
+        self.activate_version_target = None
+        self._pending_activate_version = None
+        self._version_published = True
+        self._on_staging_rotated()
+
+        self._replace_table_from(staging, live)
+        self.logger.info(
+            "ACTIVATE_VERSION: %s replaced from staging at version %s",
+            self.table_name,
+            version,
+        )
+        self.client.delete_table(staging.as_ref(), not_found_ok=True)
+
     def _replace_table_from(self, source: "BigQueryTable", dest: "BigQueryTable") -> None:
         """Atomically replace *dest*'s contents with everything in *source*.
 
@@ -644,31 +685,22 @@ class BaseBigQuerySink(BatchSink):
         """Finalize at end-of-pipe: publish a versioned run, or MERGE/overwrite
         staging into the target, then tear down. Unlike checkpoint(), terminal."""
         if self.activate_version_target is not None:
-            live = self.activate_version_target
-            staging = self.table
-            version = self._pending_activate_version
-
-            # Restore self.table to the live table before any cleanup.
-            self.table = live
-            self.activate_version_target = None
-            self._pending_activate_version = None
-
-            if version is None:
+            if self._pending_activate_version is None:
+                # Tap failed or the extract was incomplete: no ACTIVATE_VERSION
+                # arrived, so discard the staged rows and leave live untouched.
+                staging = self.table
+                self.table = self.activate_version_target
+                self.activate_version_target = None
                 self.logger.warning(
                     "Versioned run for %s ended without ACTIVATE_VERSION; discarding"
                     " staged rows in %s and leaving the live table unchanged.",
                     self.stream_name,
                     staging.name,
                 )
+                self.client.delete_table(staging.as_ref(), not_found_ok=True)
             else:
-                self._replace_table_from(staging, live)
-                self.logger.info(
-                    "ACTIVATE_VERSION: %s replaced from staging at version %s",
-                    self.table_name,
-                    version,
-                )
-
-            self.client.delete_table(staging.as_ref(), not_found_ok=True)
+                # ACTIVATE_VERSION arrived after the last mid-run drain.
+                self.finalize_version()
             return
 
         if self.merge_target is not None:
