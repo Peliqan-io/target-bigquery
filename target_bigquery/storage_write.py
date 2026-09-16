@@ -858,6 +858,17 @@ class BigQueryStorageWriteSink(BaseBigQuerySink):
         self._wait_for_fallback_jobs()
         super().clean_up()
 
+    def finalize_version(self) -> None:
+        # Durability barrier before the versioned swap, mirroring clean_up() and
+        # checkpoint(): commit any application streams (no-op for _default) and
+        # await oversized-row fallback Load Jobs, so every staged row is in the
+        # temp table before it replaces the live one (PQ-4216).
+        if self.activate_version_target is None or self._pending_activate_version is None:
+            return
+        self.commit_streams()
+        self._wait_for_fallback_jobs()
+        super().finalize_version()
+
     def pre_state_hook(self) -> None:
         self.commit_streams()
         self._wait_for_fallback_jobs()
