@@ -537,7 +537,7 @@ class BaseBigQuerySink(BatchSink):
             self.client,
             self.apply_transforms,
             **{
-                "table": {"expires": datetime.datetime.now() + datetime.timedelta(days=1)},
+                "table": {"expires": datetime.datetime.now() + datetime.timedelta(days=7)},
                 "dataset": {
                     "location": self.config.get(
                         "location", BigQueryTable.default_dataset_options()["location"]
