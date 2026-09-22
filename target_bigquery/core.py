@@ -722,7 +722,7 @@ class Denormalized:
         current_schema = table.schema[:]
         mut_schema = table.schema[:]
         for expected_field in self.table.get_resolved_schema(self.apply_transforms):
-            if not any(field.name == expected_field.name for field in current_schema):
+            if not any(field.name.lower() == expected_field.name.lower() for field in current_schema):
                 mut_schema.append(expected_field)
         if len(mut_schema) > len(current_schema):
             table.schema = mut_schema

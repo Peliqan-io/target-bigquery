@@ -95,3 +95,30 @@ def test_diff_base_is_fetched_not_built_locally():
     fetched_ref = sink.client.get_table.call_args[0][0]
     assert fetched_ref == table.as_ref()
     assert [f.name for f in table.as_table().schema] == ["colA", "CostcenterCode"]
+
+
+def test_case_only_difference_is_not_re_added():
+    """BigQuery enforces column uniqueness case-insensitively but stores the case
+    it was given, so a live `created` already IS the tap's `Created`. Appending it
+    makes update_table fail with
+
+        400 PATCH ...: Field Created already exists in schema
+
+    which kills the whole run. Reads and MERGEs are unaffected either way, since
+    BigQuery SQL identifiers are case-insensitive.
+    """
+    sink = Sink(make_table("Created", "Currency"), ["created", "currency"])
+
+    sink.update_schema()
+
+    sink.client.update_table.assert_not_called()
+
+
+def test_genuinely_new_column_still_added_alongside_case_only_matches():
+    """Case-insensitive matching must not swallow real schema drift."""
+    sink = Sink(make_table("Created", "NewCol"), ["created"])
+
+    sink.update_schema()
+
+    table = sink.client.update_table.call_args[0][0]
+    assert [f.name for f in table.schema] == ["created", "NewCol"]
