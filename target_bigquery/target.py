@@ -582,6 +582,26 @@ class TargetBigQuery(Target):
         super()._process_record_message(message_dict)
         self._records_since_checkpoint += 1
 
+    def _process_activate_version_message(self, message_dict: dict) -> None:
+        """Publish a versioned stream as soon as its ACTIVATE_VERSION arrives.
+
+        The tap sends ACTIVATE_VERSION after the stream's last record, so every
+        row for this version is either buffered in the sink or in flight in a
+        worker. Drain the buffer, then run the same durability barrier as the
+        mid-run checkpoint (join workers, surface worker errors, per-method
+        pre_state_hook) before swapping, so no row lands after the swap. The
+        worker pool re-grows on the next drain_one(). A failure raises before
+        the swap, leaving the live table untouched."""
+        super()._process_activate_version_message(message_dict)
+        sink = self.get_sink(message_dict["stream"])
+        if getattr(sink, "activate_version_target", None) is None:
+            return
+        self.drain_one(sink)
+        self._shutdown_workers()
+        self._raise_pending_worker_error()
+        sink.pre_state_hook()
+        sink.publish_version()
+
     def _method_supports_checkpoint(self) -> bool:
         """Whether the configured target method supports the non-destructive
         checkpoint()/MERGE path PQ-3547 relies on. Only `batch_job` and
