@@ -1966,3 +1966,92 @@ def test_commit_streams_does_not_raise_when_no_stream_errors():
         s.commit_streams()  # clean commit -> must not raise
     committer.batch_commit_write_streams.assert_called_once()
     assert s.open_streams == set()  # reset after a successful commit
+
+
+# --------------------------------------------------------------------------- #
+# PQ-4461: deletes before inserts                                             #
+# --------------------------------------------------------------------------- #
+
+
+def _ordered_drain_target(sink, calls, buffer=None):
+    """A bare target whose drain_all records the order of deletes vs publishes."""
+    t = _bare_target(buffer={"Accounts": [{"id": "a1"}]} if buffer is None else buffer)
+    t._latest_state = {"bookmarks": {"x": 1}}
+    t._sinks_active = {"Accounts": sink}
+    t.workers = []
+    t.max_parallelism = 1
+    t._drain_all = MagicMock()
+    t._shutdown_workers = MagicMock(side_effect=lambda: calls.append("barrier"))
+    t._raise_pending_worker_error = MagicMock()
+    t._flush_deletes = MagicMock(side_effect=lambda: calls.append("delete"))
+    t._write_state_message = MagicMock(side_effect=lambda state: calls.append("state"))
+    t._reset_max_record_age = MagicMock()
+    t._records_since_checkpoint = 5
+    return t
+
+
+# WHY: a delete followed by a re-insert of the same key in one run must keep the
+#      re-inserted rows, so deletes run before clean_up() publishes staging.
+def test_drain_all_applies_deletes_before_publishing_at_end_of_pipe():
+    calls = []
+    sink = MagicMock()
+    sink.clean_up.side_effect = lambda: calls.append("publish")
+    t = _ordered_drain_target(sink, calls)
+    t.drain_all(is_endofpipe=True)
+    assert calls == ["barrier", "delete", "publish", "state"]
+
+
+# WHY: the same order holds for a mid-run checkpoint (MERGE of staging).
+def test_drain_all_applies_deletes_before_checkpoint_mid_run():
+    calls = []
+    sink = MagicMock(overwrite_target=None)
+    sink.checkpoint.side_effect = lambda: calls.append("publish")
+    t = _ordered_drain_target(sink, calls)
+    t._sink_checkpoint_eligible = lambda s: True
+    t.drain_all(is_endofpipe=False)
+    assert calls == ["barrier", "delete", "publish", "state"]
+    assert t._records_since_checkpoint == 0
+
+
+# WHY: a failed delete must not publish staged rows or advance the bookmark, so
+#      the tap replays both on the next run.
+def test_drain_all_publishes_nothing_when_delete_fails():
+    calls = []
+    sink = MagicMock()
+    sink.clean_up.side_effect = lambda: calls.append("publish")
+    t = _ordered_drain_target(sink, calls)
+    t._flush_deletes = MagicMock(side_effect=Exception("permission denied"))
+    with pytest.raises(Exception):
+        t.drain_all(is_endofpipe=True)
+    assert "publish" not in calls and "state" not in calls
+
+
+# WHY: a caller publishing one stream on its own applies only that stream's
+#      deletes; the others stay buffered for the next drain.
+def test_flush_deletes_limited_to_given_streams():
+    t = _bare_target(buffer={"Accounts": [{"id": "a1"}], "Contacts": [{"id": "c1"}]})
+    client = MagicMock()
+    with patch("target_bigquery.target.bigquery_client_factory", return_value=client):
+        t._flush_deletes(["Accounts", "NotBuffered"])
+    sql = [c.args[0] for c in client.query.call_args_list]
+    assert len(sql) == 1 and "`accounts`" in sql[0]
+    assert t._delete_buffer == {"Contacts": [{"id": "c1"}]}
+
+
+# WHY: a keyless stream has no key to MERGE on; its staged rows are appended to
+#      the real table with an INSERT, then the staging table is dropped.
+def test_keyless_staging_publishes_with_insert():
+    from target_bigquery.core import BigQueryTable
+
+    s = _merge_sink()
+    s._key_properties = []
+    opts = dict(s._staging_opts, jsonschema={"properties": {"DocSeqNr": {"type": ["integer"]},
+                                                            "Amount": {"type": ["number"]}}})
+    s.merge_target = BigQueryTable(name="salesinvoicelines", **opts)
+    s._staging_open = True
+    s.checkpoint()
+    (sql,), _ = s.client.query.call_args
+    assert sql.startswith("INSERT INTO `p.d.salesinvoicelines` (`DocSeqNr`, `Amount`")
+    assert "SELECT `DocSeqNr`, `Amount`" in sql and "salesinvoicelines__100" in sql
+    assert "DROP TABLE IF EXISTS" in sql and "MERGE" not in sql
+    assert s._staging_open is False
