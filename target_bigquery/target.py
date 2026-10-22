@@ -354,8 +354,9 @@ class TargetBigQuery(Target):
         super().__init__(*args, **kwargs)
         self.max_parallelism = 1
         # Buffer for DELETERECORD Singer messages keyed by stream name.
-        # Populated in _process_unknown_message; flushed in drain_all before any
-        # staged rows are published, so deletes always land before inserts.
+        # Populated in _process_unknown_message; applied before the stream's rows
+        # reach the real table (drain_one for sinks without staging, drain_all
+        # before staging is published), so deletes always land before inserts.
         self._delete_buffer: dict = {}
         (
             self.proc_cls,
@@ -567,8 +568,8 @@ class TargetBigQuery(Target):
 
         DELETERECORD is a Peliqan Singer extension not in the SDK's
         SingerMessageType enum, so the SDK routes it here.  We buffer the
-        record keyed by stream; drain_all() applies the buffer with
-        _flush_deletes() before it publishes any staged rows.
+        record keyed by stream; _flush_deletes() applies it before the stream's
+        rows reach the real table (drain_one / drain_all).
         """
         if message_dict.get("type") == "DELETERECORD":
             stream = message_dict.get("stream", "")
@@ -746,7 +747,21 @@ class TargetBigQuery(Target):
         # on current_size so empty drains never create a table.
         if sink.current_size:
             sink.ensure_staging()
+            # Deletes before inserts (PQ-4461): a sink without staging (keyless,
+            # FIXED or non-upsert streams) writes this batch straight to the real
+            # table, so apply its stream's buffered deletes first. Staged sinks
+            # get theirs in drain_all, before staging is published.
+            if sink.stream_name in self._delete_buffer and self._writes_directly(sink):
+                self._flush_deletes([sink.stream_name])
         super().drain_one(sink)
+
+    @staticmethod
+    def _writes_directly(sink: Sink) -> bool:
+        """Whether the sink's batches go straight to the real table (no staging table)."""
+        return all(
+            getattr(sink, attr, None) is None
+            for attr in ("merge_target", "overwrite_target", "activate_version_target")
+        )
 
     def drain_all(self, is_endofpipe: bool = False) -> None:  # type: ignore
         """Drain all sinks and write state message. If is_endofpipe, execute clean_up() on all sinks.
@@ -831,7 +846,7 @@ class TargetBigQuery(Target):
         """Apply buffered DELETERECORDs as one batched, parameterized DELETE per
         table. Storage-mode-aware (FIXED -> JSON_VALUE(data,...), DENORMALIZED ->
         real columns). `streams` limits it to those streams' buffered deletes
-        (for a caller that publishes one stream on its own); default is all.
+        (drain_one, before a stream's batch is written directly); default is all.
 
         Error policy mirrors target-postgres: a delete that cannot be *applied* is
         a best-effort skip -- a key matching no rows is not an error in BigQuery
@@ -863,7 +878,7 @@ class TargetBigQuery(Target):
         batch_size = self.config.get("batch_size", 10_000)
 
         selected = list(self._delete_buffer) if streams is None else [
-            s for s in streams if s in self._delete_buffer
+            s for s in dict.fromkeys(streams) if s in self._delete_buffer
         ]
         for stream in selected:
             records = self._delete_buffer[stream]

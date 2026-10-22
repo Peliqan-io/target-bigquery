@@ -330,20 +330,17 @@ class BaseBigQuerySink(BatchSink):
         self.update_schema()
         self.merge_target: Optional[BigQueryTable] = None
         self.overwrite_target: Optional[BigQueryTable] = None
-        # In absence of upsert or overwrite candidacy, we append to the target table directly
+        # In absence of dedupe or overwrite candidacy, we append to the target table directly
         # If the stream is marked for one of these strategies, we create a temporary table instead
         # and merge or overwrite the target table with the temporary table after the ingest.
         self._staging_open = False
         self.activate_version_target = None
         self._pending_activate_version = None
         if (
-            self.ingestion_strategy is IngestionStrategy.DENORMALIZED
+            key_properties
+            and self.ingestion_strategy is IngestionStrategy.DENORMALIZED
             and self._is_upsert_candidate()
         ):
-            # Every upsert-candidate stream stages, keyed or not (PQ-4461), so its
-            # rows reach the real table only when staging is published -- after
-            # that drain's deletes (TargetBigQuery.drain_all). A keyed stream
-            # publishes by MERGE, a keyless one by INSERT.
             # Lazy staging generation (PQ-3547): no staging table is created
             # here. ensure_staging() opens one right before the first batch is
             # enqueued, and checkpoint() closes it (MERGE + DROP) without
@@ -551,20 +548,10 @@ class BaseBigQuerySink(BatchSink):
         time.sleep(2.5)  # Wait for eventual consistency
 
     def _merge_staging_into_target(self) -> None:
-        """Publish the current temp table into merge_target: dedupe + MERGE on the
-        key, or a plain INSERT when the stream has no key. Raises on failure —
-        never drops the temp, never swallows (PQ-3547: a failed MERGE must not
-        advance the bookmark or silently lose the staged batch)."""
+        """Dedupe + MERGE the current temp table into merge_target. Raises on
+        failure — never drops the temp, never swallows (PQ-3547: a failed MERGE
+        must not advance the bookmark or silently lose the staged batch)."""
         target = self.merge_target.as_table()
-        if not self.key_properties:
-            # No key to MERGE on: the staged rows are appended as they are.
-            columns = ", ".join(f"`{f.name}`" for f in target.schema)
-            self.client.query(
-                f"INSERT INTO `{self.merge_target}` ({columns}) "
-                f"SELECT {columns} FROM {self.table.get_escaped_name()}; "
-                f"DROP TABLE IF EXISTS {self.table.get_escaped_name()};"
-            ).result()
-            return
         date_columns = ["_sdc_extracted_at", "_sdc_received_at"]
         tmp, ctas_tmp = None, "SELECT 1 AS _no_op"
         if self._is_dedupe_before_upsert_candidate():

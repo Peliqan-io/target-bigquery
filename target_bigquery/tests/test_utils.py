@@ -2032,26 +2032,41 @@ def test_flush_deletes_limited_to_given_streams():
     t = _bare_target(buffer={"Accounts": [{"id": "a1"}], "Contacts": [{"id": "c1"}]})
     client = MagicMock()
     with patch("target_bigquery.target.bigquery_client_factory", return_value=client):
-        t._flush_deletes(["Accounts", "NotBuffered"])
+        t._flush_deletes(["Accounts", "Accounts", "NotBuffered"])
     sql = [c.args[0] for c in client.query.call_args_list]
     assert len(sql) == 1 and "`accounts`" in sql[0]
     assert t._delete_buffer == {"Contacts": [{"id": "c1"}]}
 
 
-# WHY: a keyless stream has no key to MERGE on; its staged rows are appended to
-#      the real table with an INSERT, then the staging table is dropped.
-def test_keyless_staging_publishes_with_insert():
-    from target_bigquery.core import BigQueryTable
+def _direct_drain_target(sink, calls, buffer):
+    """A bare target whose drain_one records deletes vs the batch write."""
+    t = _bare_target(buffer=buffer)
+    t.resize_worker_pool = MagicMock()
+    for name in ("job_notification", "log_notification", "error_notification"):
+        setattr(t, name, MagicMock(poll=MagicMock(return_value=False)))
+    t._flush_deletes = MagicMock(side_effect=lambda streams=None: calls.append(("delete", streams)))
+    return t
 
-    s = _merge_sink()
-    s._key_properties = []
-    opts = dict(s._staging_opts, jsonschema={"properties": {"DocSeqNr": {"type": ["integer"]},
-                                                            "Amount": {"type": ["number"]}}})
-    s.merge_target = BigQueryTable(name="salesinvoicelines", **opts)
-    s._staging_open = True
-    s.checkpoint()
-    (sql,), _ = s.client.query.call_args
-    assert sql.startswith("INSERT INTO `p.d.salesinvoicelines` (`DocSeqNr`, `Amount`")
-    assert "SELECT `DocSeqNr`, `Amount`" in sql and "salesinvoicelines__100" in sql
-    assert "DROP TABLE IF EXISTS" in sql and "MERGE" not in sql
-    assert s._staging_open is False
+
+# WHY: a sink without staging (keyless / FIXED / non-upsert) writes its batch
+#      straight to the real table, so its stream's deletes must run first.
+def test_drain_one_applies_deletes_before_a_direct_write():
+    calls = []
+    sink = MagicMock(stream_name="Accounts", current_size=3, merge_target=None,
+                     overwrite_target=None, activate_version_target=None)
+    t = _direct_drain_target(sink, calls, {"Accounts": [{"id": "a1"}], "Contacts": [{"id": "c1"}]})
+    with patch("singer_sdk.target_base.Target.drain_one", side_effect=lambda s: calls.append("write")):
+        t.drain_one(sink)
+    assert calls == [("delete", ["Accounts"]), "write"]
+
+
+# WHY: a staged sink publishes only in drain_all (after the deletes there), so
+#      drain_one leaves its deletes buffered.
+def test_drain_one_leaves_deletes_of_a_staged_sink_for_drain_all():
+    calls = []
+    sink = MagicMock(stream_name="Accounts", current_size=3, merge_target=object(),
+                     overwrite_target=None, activate_version_target=None)
+    t = _direct_drain_target(sink, calls, {"Accounts": [{"id": "a1"}]})
+    with patch("singer_sdk.target_base.Target.drain_one", side_effect=lambda s: calls.append("write")):
+        t.drain_one(sink)
+    assert calls == ["write"]
