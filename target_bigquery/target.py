@@ -611,6 +611,27 @@ class TargetBigQuery(Target):
             and getattr(sink, "overwrite_target", None) is None
         )
 
+    def _sink_version_finalizable(self, sink: "BaseBigQuerySink") -> bool:
+        """Whether an individual active sink is holding a completed versioned
+        (FULL_TABLE) stream that can be published on a mid-run drain (PQ-4216).
+
+        True once the tap's ACTIVATE_VERSION has arrived for a sink that routed
+        its records into a staging table. Gated on the method, like
+        checkpoint(): `gcs_stage` and `streaming_insert` keep publishing at
+        end-of-pipe."""
+        return (
+            self._method_supports_checkpoint()
+            and getattr(sink, "activate_version_target", None) is not None
+            and getattr(sink, "_pending_activate_version", None) is not None
+        )
+
+    def _has_finalizable_version(self) -> bool:
+        """Whether any active sink has a completed versioned stream to publish."""
+        return any(
+            self._sink_version_finalizable(sink)
+            for sink in self._sinks_active.values()
+        )
+
     def _row_threshold_checkpoint_eligible(self) -> bool:
         """Whether this run is in scope for PQ-3547 row-threshold mid-run
         checkpoints (MERGE + STATE at a category boundary).
@@ -627,6 +648,11 @@ class TargetBigQuery(Target):
         sinks = list(self._sinks_active.values())
         if any(getattr(sink, "overwrite_target", None) is not None for sink in sinks):
             return False
+        # A versioned (FULL_TABLE) run has no merge sink -- merge_target is
+        # nulled when the stream is routed into staging -- so without this the
+        # boundary drain that publishes it would never fire (PQ-4216).
+        if self._has_finalizable_version():
+            return True
         return any(getattr(sink, "merge_target", None) is not None for sink in sinks)
 
     def _process_state_message(self, message_dict: dict) -> None:
@@ -801,7 +827,11 @@ class TargetBigQuery(Target):
                 for sink in self._sinks_active.values()
             )
             for sink in self._sinks_active.values():
-                if not has_overwrite and self._sink_checkpoint_eligible(sink):
+                if self._sink_version_finalizable(sink):
+                    # Completed FULL_TABLE stream: swap staging onto the live
+                    # table now rather than at end-of-pipe (PQ-4216).
+                    sink.finalize_version()
+                elif not has_overwrite and self._sink_checkpoint_eligible(sink):
                     sink.checkpoint()
                 else:
                     sink.pre_state_hook()

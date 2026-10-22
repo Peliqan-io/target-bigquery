@@ -337,3 +337,100 @@ def test_overwrite_path_uses_replace(recorder):
     sink = target._sinks_active["overwrite_stream"]
     assert sink.table is not None, "B3: self.table must not be None after overwrite"
     assert sink.table.name == "overwrite_stream"
+
+
+# --------------------------------------------------------------------------- #
+# Mid-run publication (PQ-4216): the swap happens at the stream boundary, not
+# at end-of-pipe, so staging never has to outlive its 24h expiry.
+# --------------------------------------------------------------------------- #
+def test_version_published_at_stream_boundary_not_end_of_run(recorder):
+    """The swap must happen when the tap moves on, before end-of-pipe."""
+    target = TargetBigQuery(config=CONFIG)
+    target._process_lines(io.StringIO("\n".join([
+        schema_line("deals"),
+        record_line("deals", {"id": 1, "value": "a"}, version=100),
+        state_line("deals"),
+        activate_line("deals", 100),
+        # The tap moves on: this SCHEMA is the boundary that publishes "deals".
+        schema_line("contacts"),
+        record_line("contacts", {"id": 1, "value": "x"}),
+        state_line("contacts"),
+    ]) + "\n"))
+
+    assert len(recorder.replaced) == 1, "deals should be published before end-of-pipe"
+    source, dest = recorder.replaced[0]
+    assert recorder.is_staging(source)
+    assert dest == "deals"
+
+    target.drain_all(is_endofpipe=True)
+
+    assert len(recorder.replaced) == 1, "clean_up must not swap a second time"
+
+
+def test_records_after_publication_go_to_the_live_table(recorder):
+    """A record arriving after the swap must append to live, not a new staging."""
+    target = TargetBigQuery(config=CONFIG)
+    target._process_lines(io.StringIO("\n".join([
+        schema_line("deals"),
+        record_line("deals", {"id": 1, "value": "a"}, version=100),
+        state_line("deals"),
+        activate_line("deals", 100),
+        schema_line("contacts"),
+        state_line("contacts"),
+    ]) + "\n"))
+    staging_after_publish = [t for t in recorder.created if recorder.is_staging(t)]
+
+    target._process_lines(io.StringIO("\n".join([
+        record_line("deals", {"id": 2, "value": "b"}, version=100),
+        state_line("deals"),
+    ]) + "\n"))
+    target.drain_all(is_endofpipe=True)
+
+    assert [t for t in recorder.created if recorder.is_staging(t)] == staging_after_publish, (
+        "a late record must not open a new staging generation"
+    )
+    assert len(recorder.replaced) == 1, "late records must not trigger a second swap"
+
+
+def test_versioned_only_run_still_publishes_at_the_boundary(recorder):
+    """A run with no merge sink at all must still drain at stream boundaries."""
+    target = TargetBigQuery(config=CONFIG)
+    target._process_lines(io.StringIO("\n".join([
+        schema_line("first"),
+        record_line("first", {"id": 1, "value": "a"}, version=100),
+        state_line("first"),
+        activate_line("first", 100),
+        schema_line("second"),
+        record_line("second", {"id": 1, "value": "b"}, version=200),
+        state_line("second"),
+        activate_line("second", 200),
+    ]) + "\n"))
+
+    assert [dest for _, dest in recorder.replaced] == ["first"], (
+        "first should publish at the boundary; second waits for end-of-pipe"
+    )
+
+    target.drain_all(is_endofpipe=True)
+
+    assert [dest for _, dest in recorder.replaced] == ["first", "second"]
+
+
+def test_incomplete_versioned_stream_is_not_published_early(recorder):
+    """Without ACTIVATE_VERSION, a stream boundary must not publish staging."""
+    target = TargetBigQuery(config=CONFIG)
+    target._process_lines(io.StringIO("\n".join([
+        schema_line("deals"),
+        record_line("deals", {"id": 1, "value": "a"}, version=100),
+        state_line("deals"),
+        # tap errored: no ACTIVATE_VERSION for deals
+        schema_line("contacts"),
+        record_line("contacts", {"id": 1, "value": "x"}),
+        state_line("contacts"),
+    ]) + "\n"))
+
+    assert recorder.replaced == [], "must not publish a stream that never activated"
+
+    target.drain_all(is_endofpipe=True)
+
+    assert recorder.replaced == [], "clean_up must still discard, not publish"
+    assert any(recorder.is_staging(d) for d in recorder.deleted)
