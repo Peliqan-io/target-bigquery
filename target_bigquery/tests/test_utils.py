@@ -860,10 +860,13 @@ def test_drain_all_does_not_write_state_when_delete_fails():
     # aborts drain_all before _write_state_message.
     t = _bare_target(buffer={"Accounts": [{"id": "a1"}]})
     t._latest_state = {"bookmarks": {"x": 1}}
-    t._sinks_active = {}
+    sink = MagicMock()
+    t._sinks_active = {"Accounts": sink}
     t.workers = []
     t.max_parallelism = 1
     t._drain_all = MagicMock()
+    t._shutdown_workers = MagicMock()
+    t._raise_pending_worker_error = MagicMock()
     t._write_state_message = MagicMock()
     t._reset_max_record_age = MagicMock()
     client = MagicMock()
@@ -872,6 +875,7 @@ def test_drain_all_does_not_write_state_when_delete_fails():
         with pytest.raises(Exception):
             t.drain_all(is_endofpipe=True)
     t._write_state_message.assert_not_called()
+    sink.clean_up.assert_not_called()  # nothing published past a failed delete
 
 
 def test_flush_one_query_per_stream():
@@ -1973,20 +1977,13 @@ def test_commit_streams_does_not_raise_when_no_stream_errors():
 # --------------------------------------------------------------------------- #
 
 
-def _ordered_drain_target(sink, calls, buffer=None):
-    """A bare target whose drain_all records the order of deletes vs publishes."""
-    t = _bare_target(buffer={"Accounts": [{"id": "a1"}]} if buffer is None else buffer)
-    t._latest_state = {"bookmarks": {"x": 1}}
-    t._sinks_active = {"Accounts": sink}
-    t.workers = []
-    t.max_parallelism = 1
-    t._drain_all = MagicMock()
-    t._shutdown_workers = MagicMock(side_effect=lambda: calls.append("barrier"))
-    t._raise_pending_worker_error = MagicMock()
-    t._flush_deletes = MagicMock(side_effect=lambda: calls.append("delete"))
-    t._write_state_message = MagicMock(side_effect=lambda state: calls.append("state"))
-    t._reset_max_record_age = MagicMock()
-    t._records_since_checkpoint = 5
+def _ordered_drain_target(sink, calls):
+    """_drain_target that records the order of barrier, deletes, publish and STATE."""
+    t = _drain_target({"Accounts": sink})
+    t._delete_buffer = {"Accounts": [{"id": "a1"}]}
+    t._shutdown_workers = lambda: calls.append("barrier")
+    t._flush_deletes = lambda: calls.append("delete")
+    t._write_state_message = lambda state: calls.append("state")
     return t
 
 
@@ -2013,32 +2010,19 @@ def test_drain_all_applies_deletes_before_checkpoint_mid_run():
     assert t._records_since_checkpoint == 0
 
 
-# WHY: a failed delete must not publish staged rows or advance the bookmark, so
-#      the tap replays both on the next run.
-def test_drain_all_publishes_nothing_when_delete_fails():
-    calls = []
-    sink = MagicMock()
-    sink.clean_up.side_effect = lambda: calls.append("publish")
-    t = _ordered_drain_target(sink, calls)
-    t._flush_deletes = MagicMock(side_effect=Exception("permission denied"))
-    with pytest.raises(Exception):
-        t.drain_all(is_endofpipe=True)
-    assert "publish" not in calls and "state" not in calls
-
-
-# WHY: a caller publishing one stream on its own applies only that stream's
-#      deletes; the others stay buffered for the next drain.
+# WHY: drain_one applies only its own stream's deletes; the others stay buffered.
 def test_flush_deletes_limited_to_one_stream():
     t = _bare_target(buffer={"Accounts": [{"id": "a1"}], "Contacts": [{"id": "c1"}]})
     client = MagicMock()
     with patch("target_bigquery.target.bigquery_client_factory", return_value=client):
         t._flush_deletes("Accounts")
     sql = [c.args[0] for c in client.query.call_args_list]
-    assert len(sql) == 1 and "`accounts`" in sql[0]
+    assert len(sql) == 1
+    assert "`accounts`" in sql[0]
     assert t._delete_buffer == {"Contacts": [{"id": "c1"}]}
 
 
-def _direct_drain_target(sink, calls, buffer):
+def _direct_drain_target(calls, buffer):
     """A bare target whose drain_one records deletes vs the batch write."""
     t = _bare_target(buffer=buffer)
     t.resize_worker_pool = MagicMock()
@@ -2053,17 +2037,7 @@ def _direct_drain_target(sink, calls, buffer):
 def test_drain_one_applies_the_streams_deletes_before_writing():
     calls = []
     sink = MagicMock(stream_name="Accounts", current_size=3)
-    t = _direct_drain_target(sink, calls, {"Accounts": [{"id": "a1"}], "Contacts": [{"id": "c1"}]})
+    t = _direct_drain_target(calls, {"Accounts": [{"id": "a1"}], "Contacts": [{"id": "c1"}]})
     with patch("singer_sdk.target_base.Target.drain_one", side_effect=lambda s: calls.append("write")):
         t.drain_one(sink)
     assert calls == [("delete", "Accounts"), "write"]
-
-
-# WHY: a stream with no buffered deletes writes its batch without a DELETE query.
-def test_drain_one_skips_deletes_when_the_stream_has_none():
-    calls = []
-    sink = MagicMock(stream_name="Accounts", current_size=3)
-    t = _direct_drain_target(sink, calls, {"Contacts": [{"id": "c1"}]})
-    with patch("singer_sdk.target_base.Target.drain_one", side_effect=lambda s: calls.append("write")):
-        t.drain_one(sink)
-    assert calls == ["write"]

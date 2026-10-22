@@ -746,12 +746,12 @@ class TargetBigQuery(Target):
         # immediately before its buffered records are turned into jobs. Gated
         # on current_size so empty drains never create a table.
         if sink.current_size:
-            sink.ensure_staging()
             # Deletes before inserts (PQ-4461): apply this stream's buffered deletes
             # before its batch is written (a sink without staging writes it straight
             # to the real table).
             if sink.stream_name in self._delete_buffer:
                 self._flush_deletes(sink.stream_name)
+            sink.ensure_staging()
         super().drain_one(sink)
 
     def drain_all(self, is_endofpipe: bool = False) -> None:  # type: ignore
@@ -759,9 +759,9 @@ class TargetBigQuery(Target):
 
         Fail-fast checkpoint finalization (PQ-3547): sinks are finalized
         (checkpoint() mid-run / clean_up() at end-of-pipe) in a plain loop
-        with no per-sink exception handling, after this drain's deletes were
-        applied. The first failure propagates immediately, before
-        `_write_state_message()` runs, so a failed checkpoint/clean_up emits
+        with no per-sink exception handling. The first failure propagates
+        immediately, before
+        `_write_state_message()` run, so a failed checkpoint/clean_up emits
         no STATE for that boundary and the process exits non-zero. Earlier
         sinks that already finalized successfully in the same loop are not
         rolled back -- their data is durable and safe to replay (upsert +
@@ -770,7 +770,7 @@ class TargetBigQuery(Target):
         state = copy.deepcopy(self._latest_state)
         sink: BaseBigQuerySink
         self._drain_all(list(self._sinks_active.values()), self.max_parallelism)
-        # Durability barrier: tear down worker processes via the shared helper
+        # Tear down worker processes via the shared helper
         # (fixes the old double-join/skip-first bug), which enqueues a None
         # sentinel per alive worker so each exits its blocking
         # queue.get(timeout=30.0) immediately -- a bare join() here would block
@@ -780,11 +780,8 @@ class TargetBigQuery(Target):
         # re-grows the pool on the next records.
         self._shutdown_workers()
         self._raise_pending_worker_error()
-        # Deletes before inserts (PQ-4461): apply this drain's DELETERECORDs before
-        # any staged rows are published below (clean_up() / checkpoint()), so a
-        # delete followed by a re-insert of the same key in one run keeps the
-        # re-inserted rows. A delete failure raises here, before anything is
-        # published and before STATE, so the tap replays both on the next run.
+        # Deletes before inserts (PQ-4461): remaining DELETERECORDs before staging is
+        # published below; a failure raises before publish and STATE.
         if self._delete_buffer:
             self._flush_deletes()
         if is_endofpipe:
@@ -868,9 +865,9 @@ class TargetBigQuery(Target):
         # and emits one DELETE per chunk (DML-quota friendly).
         batch_size = self.config.get("batch_size", 10_000)
 
-        streams = [stream_name] if stream_name else list(self._delete_buffer)
-        for stream in streams:
-            records = self._delete_buffer.get(stream)
+        for stream, records in self._delete_buffer.items():
+            if stream_name and stream != stream_name:
+                continue
             if not records:
                 continue
             name = prefix + stream.lower().replace("-", "_").replace(".", "_")
@@ -910,6 +907,7 @@ class TargetBigQuery(Target):
             # SQL) propagates: drain_all aborts before writing state, so the
             # bookmark is not advanced and the tap replays these deletes next run.
 
-        for stream in streams:
-            self._delete_buffer.pop(stream, None)
-
+        if stream_name:
+            self._delete_buffer.pop(stream_name, None)
+        else:
+            self._delete_buffer.clear()
