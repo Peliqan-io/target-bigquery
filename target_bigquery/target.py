@@ -747,21 +747,12 @@ class TargetBigQuery(Target):
         # on current_size so empty drains never create a table.
         if sink.current_size:
             sink.ensure_staging()
-            # Deletes before inserts (PQ-4461): a sink without staging (keyless,
-            # FIXED or non-upsert streams) writes this batch straight to the real
-            # table, so apply its stream's buffered deletes first. Staged sinks
-            # get theirs in drain_all, before staging is published.
-            if sink.stream_name in self._delete_buffer and self._writes_directly(sink):
-                self._flush_deletes([sink.stream_name])
+            # Deletes before inserts (PQ-4461): apply this stream's buffered deletes
+            # before its batch is written (a sink without staging writes it straight
+            # to the real table).
+            if sink.stream_name in self._delete_buffer:
+                self._flush_deletes(sink.stream_name)
         super().drain_one(sink)
-
-    @staticmethod
-    def _writes_directly(sink: Sink) -> bool:
-        """Whether the sink's batches go straight to the real table (no staging table)."""
-        return all(
-            getattr(sink, attr, None) is None
-            for attr in ("merge_target", "overwrite_target", "activate_version_target")
-        )
 
     def drain_all(self, is_endofpipe: bool = False) -> None:  # type: ignore
         """Drain all sinks and write state message. If is_endofpipe, execute clean_up() on all sinks.
@@ -842,11 +833,11 @@ class TargetBigQuery(Target):
             e, msg = self.error_notification.recv()
             self.logger.error(msg)
             raise RuntimeError(msg) from e
-    def _flush_deletes(self, streams: Optional[List[str]] = None) -> None:
+    def _flush_deletes(self, stream_name: Optional[str] = None) -> None:
         """Apply buffered DELETERECORDs as one batched, parameterized DELETE per
         table. Storage-mode-aware (FIXED -> JSON_VALUE(data,...), DENORMALIZED ->
-        real columns). `streams` limits it to those streams' buffered deletes
-        (drain_one, before a stream's batch is written directly); default is all.
+        real columns). `stream_name` limits it to that stream's deletes; default
+        is all streams.
 
         Error policy mirrors target-postgres: a delete that cannot be *applied* is
         a best-effort skip -- a key matching no rows is not an error in BigQuery
@@ -877,11 +868,9 @@ class TargetBigQuery(Target):
         # and emits one DELETE per chunk (DML-quota friendly).
         batch_size = self.config.get("batch_size", 10_000)
 
-        selected = list(self._delete_buffer) if streams is None else [
-            s for s in dict.fromkeys(streams) if s in self._delete_buffer
-        ]
-        for stream in selected:
-            records = self._delete_buffer[stream]
+        streams = [stream_name] if stream_name else list(self._delete_buffer)
+        for stream in streams:
+            records = self._delete_buffer.get(stream)
             if not records:
                 continue
             name = prefix + stream.lower().replace("-", "_").replace(".", "_")
@@ -921,5 +910,6 @@ class TargetBigQuery(Target):
             # SQL) propagates: drain_all aborts before writing state, so the
             # bookmark is not advanced and the tap replays these deletes next run.
 
-        for stream in selected:
-            del self._delete_buffer[stream]
+        for stream in streams:
+            self._delete_buffer.pop(stream, None)
+

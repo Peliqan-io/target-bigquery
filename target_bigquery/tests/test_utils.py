@@ -2028,11 +2028,11 @@ def test_drain_all_publishes_nothing_when_delete_fails():
 
 # WHY: a caller publishing one stream on its own applies only that stream's
 #      deletes; the others stay buffered for the next drain.
-def test_flush_deletes_limited_to_given_streams():
+def test_flush_deletes_limited_to_one_stream():
     t = _bare_target(buffer={"Accounts": [{"id": "a1"}], "Contacts": [{"id": "c1"}]})
     client = MagicMock()
     with patch("target_bigquery.target.bigquery_client_factory", return_value=client):
-        t._flush_deletes(["Accounts", "Accounts", "NotBuffered"])
+        t._flush_deletes("Accounts")
     sql = [c.args[0] for c in client.query.call_args_list]
     assert len(sql) == 1 and "`accounts`" in sql[0]
     assert t._delete_buffer == {"Contacts": [{"id": "c1"}]}
@@ -2044,29 +2044,26 @@ def _direct_drain_target(sink, calls, buffer):
     t.resize_worker_pool = MagicMock()
     for name in ("job_notification", "log_notification", "error_notification"):
         setattr(t, name, MagicMock(poll=MagicMock(return_value=False)))
-    t._flush_deletes = MagicMock(side_effect=lambda streams=None: calls.append(("delete", streams)))
+    t._flush_deletes = MagicMock(side_effect=lambda stream_name=None: calls.append(("delete", stream_name)))
     return t
 
 
 # WHY: a sink without staging (keyless / FIXED / non-upsert) writes its batch
 #      straight to the real table, so its stream's deletes must run first.
-def test_drain_one_applies_deletes_before_a_direct_write():
+def test_drain_one_applies_the_streams_deletes_before_writing():
     calls = []
-    sink = MagicMock(stream_name="Accounts", current_size=3, merge_target=None,
-                     overwrite_target=None, activate_version_target=None)
+    sink = MagicMock(stream_name="Accounts", current_size=3)
     t = _direct_drain_target(sink, calls, {"Accounts": [{"id": "a1"}], "Contacts": [{"id": "c1"}]})
     with patch("singer_sdk.target_base.Target.drain_one", side_effect=lambda s: calls.append("write")):
         t.drain_one(sink)
-    assert calls == [("delete", ["Accounts"]), "write"]
+    assert calls == [("delete", "Accounts"), "write"]
 
 
-# WHY: a staged sink publishes only in drain_all (after the deletes there), so
-#      drain_one leaves its deletes buffered.
-def test_drain_one_leaves_deletes_of_a_staged_sink_for_drain_all():
+# WHY: a stream with no buffered deletes writes its batch without a DELETE query.
+def test_drain_one_skips_deletes_when_the_stream_has_none():
     calls = []
-    sink = MagicMock(stream_name="Accounts", current_size=3, merge_target=object(),
-                     overwrite_target=None, activate_version_target=None)
-    t = _direct_drain_target(sink, calls, {"Accounts": [{"id": "a1"}]})
+    sink = MagicMock(stream_name="Accounts", current_size=3)
+    t = _direct_drain_target(sink, calls, {"Contacts": [{"id": "c1"}]})
     with patch("singer_sdk.target_base.Target.drain_one", side_effect=lambda s: calls.append("write")):
         t.drain_one(sink)
     assert calls == ["write"]
