@@ -354,8 +354,9 @@ class TargetBigQuery(Target):
         super().__init__(*args, **kwargs)
         self.max_parallelism = 1
         # Buffer for DELETERECORD Singer messages keyed by stream name.
-        # Populated in _process_unknown_message; flushed once at end-of-pipe
-        # after all sink.clean_up() calls so upserts always land before deletes.
+        # Populated in _process_unknown_message; applied before the stream's rows
+        # reach the real table (drain_one for sinks without staging, drain_all
+        # before staging is published), so deletes always land before inserts.
         self._delete_buffer: dict = {}
         (
             self.proc_cls,
@@ -567,8 +568,8 @@ class TargetBigQuery(Target):
 
         DELETERECORD is a Peliqan Singer extension not in the SDK's
         SingerMessageType enum, so the SDK routes it here.  We buffer the
-        record keyed by stream; _flush_deletes() drains the buffer at
-        end-of-pipe, after all sink.clean_up() upserts have completed.
+        record keyed by stream; _flush_deletes() applies it before the stream's
+        rows reach the real table (drain_one / drain_all).
         """
         if message_dict.get("type") == "DELETERECORD":
             stream = message_dict.get("stream", "")
@@ -745,6 +746,11 @@ class TargetBigQuery(Target):
         # immediately before its buffered records are turned into jobs. Gated
         # on current_size so empty drains never create a table.
         if sink.current_size:
+            # Deletes before inserts (PQ-4461): apply this stream's buffered deletes
+            # before its batch is written (a sink without staging writes it straight
+            # to the real table).
+            if sink.stream_name in self._delete_buffer:
+                self._flush_deletes(sink.stream_name)
             sink.ensure_staging()
         super().drain_one(sink)
 
@@ -754,7 +760,7 @@ class TargetBigQuery(Target):
         Fail-fast checkpoint finalization (PQ-3547): sinks are finalized
         (checkpoint() mid-run / clean_up() at end-of-pipe) in a plain loop
         with no per-sink exception handling. The first failure propagates
-        immediately, before `_flush_deletes()` and before
+        immediately, before
         `_write_state_message()` run, so a failed checkpoint/clean_up emits
         no STATE for that boundary and the process exits non-zero. Earlier
         sinks that already finalized successfully in the same loop are not
@@ -764,26 +770,25 @@ class TargetBigQuery(Target):
         state = copy.deepcopy(self._latest_state)
         sink: BaseBigQuerySink
         self._drain_all(list(self._sinks_active.values()), self.max_parallelism)
+        # Tear down worker processes via the shared helper
+        # (fixes the old double-join/skip-first bug), which enqueues a None
+        # sentinel per alive worker so each exits its blocking
+        # queue.get(timeout=30.0) immediately -- a bare join() here would block
+        # ~30s per worker until that Empty timeout elapsed, wasting tens of
+        # minutes over a data-heavy stream that checkpoints often (PQ-3547). It
+        # also clears self.workers, so resize_worker_pool() in drain_one()
+        # re-grows the pool on the next records.
+        self._shutdown_workers()
+        self._raise_pending_worker_error()
+        # Deletes before inserts (PQ-4461): remaining DELETERECORDs before staging is
+        # published below; a failure raises before publish and STATE.
+        if self._delete_buffer:
+            self._flush_deletes()
         if is_endofpipe:
-            # Tear down worker processes via the shared helper (fixes the old
-            # double-join/skip-first bug), THEN finalize sinks. Order preserved:
-            # shutdown -> raise pending worker error -> clean_up() -> _flush_deletes
-            # -> _write_state_message (the last three below, outside this branch).
-            self._shutdown_workers()
-            self._raise_pending_worker_error()
             for sink in self._sinks_active.values():
                 sink.clean_up()
         else:
-            # Mid-run drain (row-threshold / max-age checkpoint). Tear down
-            # worker processes via the shared helper, which enqueues a None
-            # sentinel per alive worker so each exits its blocking
-            # queue.get(timeout=30.0) immediately -- a bare join() here would
-            # block ~30s per worker until that Empty timeout elapsed, wasting
-            # tens of minutes over a data-heavy stream that checkpoints often
-            # (PQ-3547). It also clears self.workers, so resize_worker_pool()
-            # in drain_one() re-grows the pool on the next records.
-            self._shutdown_workers()
-            self._raise_pending_worker_error()
+            # Mid-run drain (row-threshold / max-age checkpoint).
             # Run-level overwrite exclusion (PQ-3547 §5.3/§10, P2). This branch
             # also runs on the singer-sdk max-age timer (_handle_max_record_age
             # -> drain_all(is_endofpipe=False)), which bypasses the
@@ -806,13 +811,6 @@ class TargetBigQuery(Target):
                 else:
                     sink.pre_state_hook()
             self._records_since_checkpoint = 0
-        # Apply buffered DELETERECORDs *before* advancing state, so the bookmark
-        # never moves past deletes that were not applied. At end-of-pipe this runs
-        # after the clean_up() upserts above (an upsert + delete of the same key in
-        # one run ends deleted). A real delete failure raises here, so the state
-        # write below is skipped and the tap replays the deletes on the next run.
-        if self._delete_buffer:
-            self._flush_deletes()
         if state:
             self._write_state_message(state)
             # The pending STATE has now been emitted; clear the flag so a later
@@ -832,10 +830,11 @@ class TargetBigQuery(Target):
             e, msg = self.error_notification.recv()
             self.logger.error(msg)
             raise RuntimeError(msg) from e
-    def _flush_deletes(self) -> None:
+    def _flush_deletes(self, stream_name: Optional[str] = None) -> None:
         """Apply buffered DELETERECORDs as one batched, parameterized DELETE per
         table. Storage-mode-aware (FIXED -> JSON_VALUE(data,...), DENORMALIZED ->
-        real columns).
+        real columns). `stream_name` limits it to that stream's deletes; default
+        is all streams.
 
         Error policy mirrors target-postgres: a delete that cannot be *applied* is
         a best-effort skip -- a key matching no rows is not an error in BigQuery
@@ -867,6 +866,8 @@ class TargetBigQuery(Target):
         batch_size = self.config.get("batch_size", 10_000)
 
         for stream, records in self._delete_buffer.items():
+            if stream_name and stream != stream_name:
+                continue
             if not records:
                 continue
             name = prefix + stream.lower().replace("-", "_").replace(".", "_")
@@ -906,4 +907,7 @@ class TargetBigQuery(Target):
             # SQL) propagates: drain_all aborts before writing state, so the
             # bookmark is not advanced and the tap replays these deletes next run.
 
-        self._delete_buffer.clear()
+        if stream_name:
+            self._delete_buffer.pop(stream_name, None)
+        else:
+            self._delete_buffer.clear()
