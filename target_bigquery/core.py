@@ -548,7 +548,7 @@ class BaseBigQuerySink(BatchSink):
         # discovery and lets the backend clean up any orphaned staging table.
         name = f"{TEMP_TABLE_MARKER}{self.table_name}__{int(time.time())}_{self._staging_seq}"
         self.table = BigQueryTable(name=name, **self._staging_opts)
-        table_options = {"expires": datetime.datetime.now() + datetime.timedelta(days=1)}
+        table_options = {"expires": datetime.datetime.now() + datetime.timedelta(days=7)}
         # Stamp the pipeline run id so the Peliqan backend can drop this staging table
         # deterministically once the run has finished, instead of guessing from the name.
         # BigQuery label values must match [a-z0-9_-]{0,63}; the id is always numeric, so
@@ -731,12 +731,22 @@ class Denormalized:
         reraise=True,
     )
     def update_schema(self: BaseBigQuerySink) -> None:
-        """Update the target schema."""
-        table = self.table.as_table()
+        """Add columns the tap now sends that the live BigQuery table lacks.
+
+        The diff base MUST come from BigQuery, not from `as_table()`. `as_table()`
+        builds a Table client-side out of this same jsonschema, so diffing against
+        it compares the tap's schema with itself, never finds a gap, and never
+        ALTERs -- while the MERGE built from that schema goes on to reference the
+        missing column and dies with "Name <col> not found inside target" (PQ-3118).
+
+        Fetching the live table also makes the update safe in the other direction:
+        the field mask replaces the schema wholesale, so a client-side base would
+        drop any column BigQuery has but the tap no longer sends."""
+        table = self.client.get_table(self.table.as_ref())
         current_schema = table.schema[:]
         mut_schema = table.schema[:]
         for expected_field in self.table.get_resolved_schema(self.apply_transforms):
-            if not any(field.name == expected_field.name for field in current_schema):
+            if not any(field.name.lower() == expected_field.name.lower() for field in current_schema):
                 mut_schema.append(expected_field)
         if len(mut_schema) > len(current_schema):
             table.schema = mut_schema
