@@ -12,6 +12,7 @@ import datetime
 import gzip
 import json
 import mmap
+import os
 import re
 import shutil
 import sys
@@ -56,6 +57,14 @@ if TYPE_CHECKING:
 # with this is an intermediate table created during a load (merge/overwrite) and
 # must be excluded from schema discovery and cleaned up by the Peliqan backend.
 TEMP_TABLE_MARKER = "pqtemp__"
+
+# Environment variable the Peliqan backend sets on this process, carrying the id of the
+# pipeline run being executed. Stamped as a label on every TEMP_TABLE_MARKER table this
+# target creates so the backend can later drop only the temp tables belonging to runs
+# that have finished. A label rather than the description, because the description
+# already carries the Singer schema dump (see default_table_options).
+PIPELINE_RUN_ID_ENV_VAR = "PELIQAN_PIPELINE_RUN_ID"
+PQ_RUN_ID_LABEL = "pq_run_id"
 
 
 class IngestionStrategy(Enum):
@@ -207,13 +216,19 @@ class BigQueryTable:
             try:
                 self._table = client.get_table(self.as_ref())
             except NotFound:
-                self._table = client.create_table(
-                    self.as_table(
-                        apply_transforms and self.ingestion_strategy != IngestionStrategy.FIXED,
-                        **kwargs["table"],
-                    ),
-                    exists_ok=True,
+                # Labels are applied to the built table rather than passed through
+                # as_table: that method is @cache'd on its kwargs, so a dict value
+                # would raise "unhashable type" there. They are also not part of the
+                # table's identity, so they have no business in the cache key.
+                table_options = dict(kwargs["table"])
+                labels = table_options.pop("labels", None)
+                table = self.as_table(
+                    apply_transforms and self.ingestion_strategy != IngestionStrategy.FIXED,
+                    **table_options,
                 )
+                if labels:
+                    table.labels = labels
+                self._table = client.create_table(table, exists_ok=True)
                 # Wait for eventual consistency
                 time.sleep(5)
         return self._dataset, self._table
@@ -533,11 +548,20 @@ class BaseBigQuerySink(BatchSink):
         # discovery and lets the backend clean up any orphaned staging table.
         name = f"{TEMP_TABLE_MARKER}{self.table_name}__{int(time.time())}_{self._staging_seq}"
         self.table = BigQueryTable(name=name, **self._staging_opts)
+        table_options = {"expires": datetime.datetime.now() + datetime.timedelta(days=7)}
+        # Stamp the pipeline run id so the Peliqan backend can drop this staging table
+        # deterministically once the run has finished, instead of guessing from the name.
+        # BigQuery label values must match [a-z0-9_-]{0,63}; the id is always numeric, so
+        # the isdigit() guard means a junk env value is skipped rather than failing the
+        # table creation and taking the whole load down with it.
+        run_id = os.environ.get(PIPELINE_RUN_ID_ENV_VAR, "")
+        if run_id.isdigit():
+            table_options["labels"] = {PQ_RUN_ID_LABEL: run_id}
         self.table.create_table(
             self.client,
             self.apply_transforms,
             **{
-                "table": {"expires": datetime.datetime.now() + datetime.timedelta(days=7)},
+                "table": table_options,
                 "dataset": {
                     "location": self.config.get(
                         "location", BigQueryTable.default_dataset_options()["location"]
