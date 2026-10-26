@@ -885,6 +885,7 @@ class TargetBigQuery(Target):
 
             sql = f"DELETE FROM {escaped} WHERE {key_expr} IN UNNEST(@vals)"
             try:
+                deleted = 0
                 for start in range(0, len(vals), batch_size):
                     chunk = vals[start:start + batch_size]
                     job_config = bigquery.QueryJobConfig(
@@ -892,9 +893,12 @@ class TargetBigQuery(Target):
                             bigquery.ArrayQueryParameter("vals", "STRING", chunk)
                         ]
                     )
-                    client.query(sql, job_config=job_config).result()
+                    job = client.query(sql, job_config=job_config)
+                    affected = job.result().num_dml_affected_rows
+                    deleted = None if affected is None or deleted is None else deleted + affected
                 self.logger.info(
-                    "delete-sync: removed up to %d row(s) from %s", len(vals), name
+                    "delete_records: deleted %s row(s) from %s (%d delete(s) requested)",
+                    "an unknown number of" if deleted is None else deleted, name, len(vals),
                 )
             except NotFound:
                 # Table/dataset absent (e.g. a stream that was never synced). The

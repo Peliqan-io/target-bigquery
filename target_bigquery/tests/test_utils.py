@@ -878,6 +878,20 @@ def test_drain_all_does_not_write_state_when_delete_fails():
     sink.clean_up.assert_not_called()  # nothing published past a failed delete
 
 
+# WHY: the log reports the rows BigQuery actually deleted (like target-postgres),
+#      and says so when BigQuery reports no count instead of logging a wrong one.
+@pytest.mark.parametrize("affected, logged", [(10, "deleted 10 row(s)"), (0, "deleted 0 row(s)"),
+                                              (None, "deleted an unknown number of row(s)")])
+def test_flush_logs_rows_deleted(caplog, affected, logged):
+    t = _bare_target(buffer={"Accounts": [{"id": "a1"}, {"id": "a2"}]})
+    client = MagicMock()
+    client.query.return_value.result.return_value.num_dml_affected_rows = affected
+    with patch("target_bigquery.target.bigquery_client_factory", return_value=client):
+        with caplog.at_level("INFO"):
+            t._flush_deletes()
+    assert f"{logged} from accounts (2 delete(s) requested)" in caplog.text
+
+
 def test_flush_one_query_per_stream():
     _, client = _run_flush(
         {"Accounts": [{"id": "a1"}], "Contacts": [{"id": "c1"}]}
