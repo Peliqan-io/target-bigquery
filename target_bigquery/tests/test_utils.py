@@ -2039,7 +2039,7 @@ def test_flush_deletes_limited_to_one_stream():
 def _direct_drain_target(calls, buffer):
     """A bare target whose drain_one records deletes vs the batch write."""
     t = _bare_target(buffer=buffer)
-    t.resize_worker_pool = MagicMock()
+    t.resize_worker_pool = lambda: calls.append("workers")
     for name in ("job_notification", "log_notification", "error_notification"):
         setattr(t, name, MagicMock(poll=MagicMock(return_value=False)))
     t._flush_deletes = MagicMock(side_effect=lambda stream_name=None: calls.append(("delete", stream_name)))
@@ -2054,4 +2054,5 @@ def test_drain_one_applies_the_streams_deletes_before_writing():
     t = _direct_drain_target(calls, {"Accounts": [{"id": "a1"}], "Contacts": [{"id": "c1"}]})
     with patch("singer_sdk.target_base.Target.drain_one", side_effect=lambda s: calls.append("write")):
         t.drain_one(sink)
-    assert calls == [("delete", "Accounts"), "write"]
+    # the DELETE runs before the pool is sized, so the batch finds a live worker
+    assert calls == [("delete", "Accounts"), "workers", "write"]
