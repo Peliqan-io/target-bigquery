@@ -2051,8 +2051,9 @@ def _direct_drain_target(calls, buffer):
 def test_drain_one_applies_the_streams_deletes_before_writing():
     calls = []
     sink = MagicMock(stream_name="Accounts", current_size=3)
+    sink.ensure_staging = lambda: calls.append("staging")
     t = _direct_drain_target(calls, {"Accounts": [{"id": "a1"}], "Contacts": [{"id": "c1"}]})
     with patch("singer_sdk.target_base.Target.drain_one", side_effect=lambda s: calls.append("write")):
         t.drain_one(sink)
-    # the DELETE runs before the pool is sized, so the batch finds a live worker
-    assert calls == [("delete", "Accounts"), "workers", "write"]
+    # the pool is sized after the DELETE and staging, so the batch finds a live worker
+    assert calls == [("delete", "Accounts"), "staging", "workers", "write"]
