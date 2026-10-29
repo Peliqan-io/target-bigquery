@@ -717,7 +717,10 @@ class TargetBigQuery(Target):
     def drain_one(self, sink: Sink) -> None:  # type: ignore
         """Drain a sink. Includes a hook to manage the worker pool and notifications."""
         #self.logger.info(f"Jobs queued : {self.queue.qsize()} | Max nb jobs queued : {os.cpu_count() * 4} | Nb workers : {len(self.workers)} | Max nb workers : {os.cpu_count() * 2}")
-        self.resize_worker_pool()
+        # Deletes before inserts (PQ-4461): apply this stream's buffered deletes before
+        # its batch is written.
+        if sink.current_size and sink.stream_name in self._delete_buffer:
+            self._flush_deletes(sink.stream_name)
         while self.job_notification.poll():
             ext_id = self.job_notification.recv()
             self.worker_pings[ext_id] = time.time()
@@ -746,12 +749,11 @@ class TargetBigQuery(Target):
         # immediately before its buffered records are turned into jobs. Gated
         # on current_size so empty drains never create a table.
         if sink.current_size:
-            # Deletes before inserts (PQ-4461): apply this stream's buffered deletes
-            # before its batch is written (a sink without staging writes it straight
-            # to the real table).
-            if sink.stream_name in self._delete_buffer:
-                self._flush_deletes(sink.stream_name)
             sink.ensure_staging()
+        # Size the pool right before the batch is queued: the DELETE and the staging
+        # table creation above can outlast an idle worker (they exit after 30 s), which
+        # would leave the batch queued with no live worker.
+        self.resize_worker_pool()
         super().drain_one(sink)
 
     def drain_all(self, is_endofpipe: bool = False) -> None:  # type: ignore
