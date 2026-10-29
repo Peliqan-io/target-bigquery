@@ -568,12 +568,24 @@ class BaseBigQuerySink(BatchSink):
             f"MERGE `{self.merge_target}` AS target USING `{tmp or self.table}` AS source ON "
             + " AND ".join(f"target.`{f}` = source.`{f}`" for f in self.key_properties)
         )
+        # STRUCT assignment is positional, so a RECORD whose subfields sit in a
+        # different order in the live table than in staging is rebuilt by name.
+        live = {f.name.lower(): f for f in getattr(self, "_live_target_schema", None) or []}
+        staged = {f.name.lower(): f for f in self.table.get_resolved_schema(self.apply_transforms)}
+
+        def source_sql(f: bigquery.SchemaField) -> str:
+            expr = f"source.`{f.name}`"
+            live_f, staged_f = live.get(f.name.lower()), staged.get(f.name.lower())
+            if live_f is None or staged_f is None:
+                return expr
+            return _aligned_record_sql(live_f, staged_f, expr)
+
         update_clause = "UPDATE SET " + ", ".join(
-            f"target.`{f.name}` = source.`{f.name}`" for f in target.schema
+            f"target.`{f.name}` = {source_sql(f)}" for f in target.schema
         )
         insert_clause = (
             f"INSERT ({', '.join(f'`{f.name}`' for f in target.schema)}) "
-            f"VALUES ({', '.join(f'source.`{f.name}`' for f in target.schema)})"
+            f"VALUES ({', '.join(source_sql(f) for f in target.schema)})"
         )
         merge_sql = (
             f"{ctas_tmp}; {merge_clause} "
@@ -694,6 +706,84 @@ class BaseBigQuerySink(BatchSink):
             )
 
 
+_STANDARD_SQL_TYPES = {"INTEGER": "INT64", "FLOAT": "FLOAT64", "BOOLEAN": "BOOL"}
+
+
+def _is_record(f: SchemaField) -> bool:
+    return f.field_type.upper() in ("RECORD", "STRUCT")
+
+
+def _record_layout(f: SchemaField) -> list:
+    """Subfield names, in order, at every nesting level."""
+    return [(s.name.lower(), _record_layout(s) if _is_record(s) else None) for s in f.fields]
+
+
+def _sql_type(f: SchemaField) -> str:
+    if _is_record(f):
+        typ = "STRUCT<" + ", ".join(f"`{s.name}` {_sql_type(s)}" for s in f.fields) + ">"
+    else:
+        typ = _STANDARD_SQL_TYPES.get(f.field_type.upper(), f.field_type.upper())
+    return f"ARRAY<{typ}>" if f.mode == "REPEATED" else typ
+
+
+def _merge_schema_fields(
+    live: List[SchemaField], expected: List[SchemaField]
+) -> Tuple[List[SchemaField], bool]:
+    """Append the `expected` fields `live` lacks, recursing into RECORDs.
+
+    Live order is kept and new fields go last at every level, so existing data
+    never shifts position. Names match case-insensitively, like BigQuery's own
+    uniqueness check. Returns the merged fields and whether anything was added."""
+    expected_by_name = {f.name.lower(): f for f in expected}
+    live_names = {f.name.lower() for f in live}
+    merged, changed = [], False
+    for f in live:
+        exp = expected_by_name.get(f.name.lower())
+        if exp is not None and _is_record(f) and _is_record(exp):
+            fields, sub_changed = _merge_schema_fields(list(f.fields), list(exp.fields))
+            if sub_changed:
+                api = f.to_api_repr()
+                api["fields"] = [s.to_api_repr() for s in fields]
+                f = SchemaField.from_api_repr(api)
+                changed = True
+        merged.append(f)
+    for exp in expected:
+        if exp.name.lower() not in live_names:
+            merged.append(exp)
+            changed = True
+    return merged, changed
+
+
+def _aligned_record_sql(target: SchemaField, source: SchemaField, expr: str, depth: int = 0) -> str:
+    """Rebuild `expr` (typed as `source`) in `target`'s subfield order, by name.
+
+    BigQuery coerces one STRUCT to another by position, ignoring names, so a
+    MERGE assigning a staging RECORD to a live RECORD whose subfields are in a
+    different order either fails or writes values into the wrong subfields.
+    Subfields the source lacks become typed NULLs. Returns `expr` unchanged
+    when the layouts already match."""
+    if not (_is_record(target) and _is_record(source)) or target.mode != source.mode:
+        return expr
+    if _record_layout(target) == _record_layout(source):
+        return expr
+    source_by_name = {s.name.lower(): s for s in source.fields}
+    elem = f"_e{depth}" if target.mode == "REPEATED" else expr
+    members = []
+    for t in target.fields:
+        s = source_by_name.get(t.name.lower())
+        if s is None:
+            members.append(f"CAST(NULL AS {_sql_type(t)}) AS `{t.name}`")
+        else:
+            sub = _aligned_record_sql(t, s, f"{elem}.`{s.name}`", depth + 1)
+            members.append(f"{sub} AS `{t.name}`")
+    if target.mode == "REPEATED":
+        return (
+            f"ARRAY(SELECT AS STRUCT {', '.join(members)} FROM UNNEST({expr}) AS {elem}"
+            f" WITH OFFSET AS _o{depth} ORDER BY _o{depth})"
+        )
+    return f"IF({expr} IS NULL, NULL, STRUCT({', '.join(members)}))"
+
+
 class Denormalized:
     """This class provides common overrides for denormalized sinks and should be subclassed
     with an existing sink with higher MRO: DenormalizedSink(Denormalized, ExistingSink)."""
@@ -717,20 +807,25 @@ class Denormalized:
 
         Fetching the live table also makes the update safe in the other direction:
         the field mask replaces the schema wholesale, so a client-side base would
-        drop any column BigQuery has but the tap no longer sends."""
+        drop any column BigQuery has but the tap no longer sends.
+
+        RECORD columns are diffed recursively: a subfield new to the tap (e.g. a
+        field Exact Online added to a nested lines record) must be added too, or
+        the MERGE assigns a wider staging STRUCT to the narrower live one and
+        fails with 400. The resulting live schema is kept for the MERGE, which
+        needs it to line STRUCT subfields up by name."""
         table = self.client.get_table(self.table.as_ref())
-        current_schema = table.schema[:]
-        mut_schema = table.schema[:]
-        for expected_field in self.table.get_resolved_schema(self.apply_transforms):
-            if not any(field.name.lower() == expected_field.name.lower() for field in current_schema):
-                mut_schema.append(expected_field)
-        if len(mut_schema) > len(current_schema):
-            table.schema = mut_schema
+        merged, changed = _merge_schema_fields(
+            list(table.schema), self.table.get_resolved_schema(self.apply_transforms)
+        )
+        if changed:
+            table.schema = merged
             self.client.update_table(
                 table,
                 ["schema"],
                 retry=bigquery.DEFAULT_RETRY.with_timeout(15),
             )
+        self._live_target_schema = merged
 
     def preprocess_record(
         self: BaseBigQuerySink, record: Dict[str, Any], context: Dict[str, Any]
