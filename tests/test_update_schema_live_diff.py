@@ -18,6 +18,7 @@ column, and a live column absent from the tap's schema is never dropped.
 from unittest.mock import MagicMock
 
 import pytest
+from google.api_core.exceptions import NotFound
 from google.cloud import bigquery
 
 from target_bigquery.core import BigQueryTable, Denormalized, IngestionStrategy
@@ -132,7 +133,7 @@ def test_genuinely_new_column_still_added_alongside_case_only_matches():
 # skipped it, so staging got a 53-field STRUCT, the live table kept 52, and   #
 # the MERGE died with 400 assigning one to the other.                         #
 # --------------------------------------------------------------------------- #
-from target_bigquery.core import BaseBigQuerySink, _aligned_record_sql
+from target_bigquery.core import BaseBigQuerySink
 
 STR = {"type": ["null", "string"]}
 
@@ -259,75 +260,72 @@ def test_live_schema_after_update_is_kept_for_merge():
     assert [f.name for f in lines.fields] == ["Amount", "New"]
 
 
-def test_aligned_record_sql_is_noop_when_layouts_match():
-    f = lines_field("a", "b")
-    assert _aligned_record_sql(f, f, "source.`Lines`") == "source.`Lines`"
-
-
-def test_aligned_record_sql_rebuilds_repeated_record_by_name():
-    sql = _aligned_record_sql(lines_field("a", "c", "b"), lines_field("a", "b", "c"), "source.`Lines`")
-    assert sql == (
-        "ARRAY(SELECT AS STRUCT _e0.`a` AS `a`, _e0.`c` AS `c`, _e0.`b` AS `b`"
-        " FROM UNNEST(source.`Lines`) AS _e0 WITH OFFSET AS _o0 ORDER BY _o0)"
-    )
-
-
-def test_aligned_record_sql_fills_subfield_source_lacks_with_typed_null():
-    target = bigquery.SchemaField(
-        "R", "RECORD", fields=[bigquery.SchemaField("a", "STRING"), bigquery.SchemaField("n", "INTEGER")]
-    )
-    source = bigquery.SchemaField("R", "RECORD", fields=[bigquery.SchemaField("a", "STRING")])
-    assert _aligned_record_sql(target, source, "source.`R`") == (
-        "IF(source.`R` IS NULL, NULL, STRUCT(source.`R`.`a` AS `a`, CAST(NULL AS INT64) AS `n`))"
-    )
-
-
-class MergeSink:
-    """Just what _merge_staging_into_target touches."""
+class StagingSink:
+    """Just what _new_staging_table touches."""
 
     apply_transforms = True
-    key_properties = ["ID"]
-    _merge = BaseBigQuerySink._merge_staging_into_target
+    table_name = "purchaseentry"
+    config = {"location": "EU"}
+    _new_staging_table = BaseBigQuerySink._new_staging_table
 
-    def __init__(self, staging_subfields, live_schema):
+    def __init__(self, tap_subfields, live_schema, merge=True):
         self.client = MagicMock()
-        self.merge_target = nested_table(*staging_subfields)
-        self.table = BigQueryTable(
-            name="purchaseentry__staging",
-            dataset="ds",
-            project="proj",
-            jsonschema=self.merge_target.jsonschema,
-            ingestion_strategy=IngestionStrategy.DENORMALIZED,
-        )
+        self.client.get_dataset.return_value = MagicMock(location="EU")
+        self.client.get_table.side_effect = NotFound("staging")
+        self._staging_seq = 0
+        tap = nested_table(*tap_subfields)
+        self._staging_opts = {
+            "project": tap.project,
+            "dataset": tap.dataset,
+            "jsonschema": tap.jsonschema,
+            "ingestion_strategy": IngestionStrategy.DENORMALIZED,
+        }
+        self.merge_target = tap if merge else None
         self._live_target_schema = live_schema
 
-    def _is_dedupe_before_upsert_candidate(self):
-        return False
-
-    def merge_sql(self):
-        self._merge()
-        return self.client.query.call_args[0][0]
+    def staging_schema(self):
+        self._new_staging_table()
+        return list(self.client.create_table.call_args[0][0].schema)
 
 
-def test_merge_rebuilds_record_whose_new_subfield_is_mid_struct_in_staging():
-    """Staging: Amount, ProjectRebillItem, Item. Live after ALTER: Amount, Item,
-    ProjectRebillItem. A plain `= source.Lines` would put Item's value into
-    ProjectRebillItem and vice versa (all STRINGs, so no error to warn us)."""
-    live = [bigquery.SchemaField("ID", "STRING"), lines_field("Amount", "Item", "ProjectRebillItem")]
-    sql = MergeSink(("Amount", "ProjectRebillItem", "Item"), live).merge_sql()
+@pytest.fixture(autouse=False)
+def no_sleep(monkeypatch):
+    monkeypatch.setattr("target_bigquery.core.time.sleep", lambda s: None)
 
-    rebuilt = (
-        "ARRAY(SELECT AS STRUCT _e0.`Amount` AS `Amount`, _e0.`Item` AS `Item`,"
-        " _e0.`ProjectRebillItem` AS `ProjectRebillItem` FROM UNNEST(source.`Lines`) AS _e0"
-        " WITH OFFSET AS _o0 ORDER BY _o0)"
+
+def test_merge_staging_takes_live_layout_not_tap_order(no_sleep):
+    """Reproduced on real BigQuery: staging built from the tap's order
+    [Amount, ProjectRebillItem, Item] MERGEd into live [Amount, Item, Gone]
+    stored ProjectRebillItem's value in Item and Item's in Gone, because STRUCT
+    assignment is positional. Staging must carry the live layout instead."""
+    live = [
+        bigquery.SchemaField("ID", "STRING"),
+        lines_field("Amount", "Item", "Gone", "ProjectRebillItem"),
+        bigquery.SchemaField("Legacy", "STRING"),
+    ]
+    schema = StagingSink(("Amount", "ProjectRebillItem", "Item"), live).staging_schema()
+
+    assert schema == live
+
+
+def test_merge_staging_layout_follows_update_schema(no_sleep):
+    sink = NestedSink(
+        nested_table("Amount", "ProjectRebillItem", "Item"),
+        [bigquery.SchemaField("ID", "STRING"), lines_field("Amount", "Item")],
     )
-    assert f"target.`Lines` = {rebuilt}" in sql
-    assert f"VALUES (source.`ID`, {rebuilt})" in sql
+    sink.update_schema()
+    staging = StagingSink(("Amount", "ProjectRebillItem", "Item"), sink._live_target_schema)
+
+    lines = {f.name: f for f in staging.staging_schema()}["Lines"]
+
+    assert [f.name for f in lines.fields] == ["Amount", "Item", "ProjectRebillItem"]
 
 
-def test_merge_sql_unchanged_when_record_layouts_match():
-    live = [bigquery.SchemaField("ID", "STRING"), lines_field("Amount", "Item")]
-    sql = MergeSink(("Amount", "Item"), live).merge_sql()
+def test_non_merge_staging_keeps_tap_schema(no_sleep):
+    """Overwrite / activate_version staging replaces the live table wholesale
+    (WRITE_TRUNCATE), so it must not resurrect live columns the tap dropped."""
+    live = [bigquery.SchemaField("ID", "STRING"), lines_field("Amount", "Item", "Gone")]
+    schema = StagingSink(("Amount", "Item"), live, merge=False).staging_schema()
 
-    assert "target.`Lines` = source.`Lines`" in sql
-    assert "VALUES (source.`ID`, source.`Lines`)" in sql
+    assert [f.name for f in schema] == ["ID", "Lines"]
+    assert [f.name for f in schema[1].fields] == ["Amount", "Item"]
