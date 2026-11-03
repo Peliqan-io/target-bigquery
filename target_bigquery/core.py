@@ -640,6 +640,32 @@ class BaseBigQuerySink(BatchSink):
             f"SELECT * FROM {source.get_escaped_name()}", job_config=job_config
         ).result()
 
+    def publish_version(self) -> None:
+        """Swap a versioned stream's staging table onto the live table as soon as
+        its ACTIVATE_VERSION arrives, instead of waiting for end-of-pipe. A later
+        failure in another stream then no longer discards this stream's swap.
+        Callers must have run the durability barrier first (buffer drained,
+        workers joined, per-method pre_state_hook). No-op unless this stream is
+        staging a versioned run and its ACTIVATE_VERSION has arrived; resets both
+        fields so clean_up() skips it."""
+        if self.activate_version_target is None or self._pending_activate_version is None:
+            return
+        live = self.activate_version_target
+        staging = self.table
+        version = self._pending_activate_version
+
+        self.table = live
+        self.activate_version_target = None
+        self._pending_activate_version = None
+
+        self._replace_table_from(staging, live)
+        self.client.delete_table(staging.as_ref(), not_found_ok=True)
+        self.logger.info(
+            "ACTIVATE_VERSION: %s replaced from staging at version %s",
+            self.table_name,
+            version,
+        )
+
     def clean_up(self) -> None:
         """Finalize at end-of-pipe: publish a versioned run, or MERGE/overwrite
         staging into the target, then tear down. Unlike checkpoint(), terminal."""
