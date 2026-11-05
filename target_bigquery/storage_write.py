@@ -220,11 +220,8 @@ def get_application_stream(client: BigQueryWriteClient, job: "Job") -> StreamCom
     append_rows_stream = BoundedOpenAppendRowsStream(client, job.template)
     rv = (write_stream.name, append_rows_stream)
     job.stream_notifier.send(rv)
-    return *rv, retry(
-        append_rows_stream.send,
-        wait=wait_fixed(2),
-        stop=stop_after_attempt(5),
-        reraise=True,
+    return *rv, retry(wait=wait_fixed(2), stop=stop_after_attempt(5), reraise=True)(
+        append_rows_stream.send
     ), client  # keep client so its channel can be closed on recycle (PQ-3820)
 
 
@@ -236,11 +233,8 @@ def get_default_stream(client: BigQueryWriteClient, job: "Job") -> StreamCompone
     append_rows_stream = BoundedOpenAppendRowsStream(client, job.template)
     rv = (job.template.write_stream, append_rows_stream)
     job.stream_notifier.send(rv)
-    return *rv, retry(
-        append_rows_stream.send,
-        wait=wait_fixed(2),
-        stop=stop_after_attempt(5),
-        reraise=True,
+    return *rv, retry(wait=wait_fixed(2), stop=stop_after_attempt(5), reraise=True)(
+        append_rows_stream.send
     ), client  # keep client so its channel can be closed on recycle (PQ-3820)
 
 
