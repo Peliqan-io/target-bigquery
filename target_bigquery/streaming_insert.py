@@ -15,7 +15,6 @@ NOTE: This is naive and will vary drastically based on network speed, for exampl
 import os
 from multiprocessing import Process
 from multiprocessing.dummy import Process as _Thread
-from queue import Empty
 from typing import Any, Dict, List, NamedTuple, Optional, Type, Union
 
 import orjson, decimal
@@ -47,37 +46,33 @@ class StreamingInsertWorker(BaseWorker):
         _http.json = orjson
         client: bigquery.Client = bigquery_client_factory(self.credentials)
         while True:
-            try:
-                job: Optional[Job] = self.queue.get(timeout=20.0)
-            except Empty:
-                break
+            job: Optional[Job] = self.next_job(20.0)
             if job is None:
                 break
             try:
                 _ = retry(
-                    client.insert_rows_json,
                     retry=retry_if_exception_type(
                         (ConnectionError, TimeoutError, NotFound, GatewayTimeout)
                     ),
                     wait=wait_fixed(1),
                     stop=stop_after_delay(10),
                     reraise=True,
-                )(table=job.table, json_rows=job.records)
+                )(client.insert_rows_json)(table=job.table, json_rows=job.records)
             except Exception as exc:
-                job.attempt += 1
+                job = job._replace(attempt=job.attempt + 1)  # Job is a NamedTuple
                 if job.attempt > 3:
                     # TODO: add a metric for this + a DLQ & wrap exception type
                     self.error_notifier.send((exc, self.serialize_exception(exc)))
                     raise
                 else:
-                    self.queue.put(job)
+                    self.retry_job = job
             else:
                 self.job_notifier.send(True)
                 self.log_notifier.send(
                     f"[{self.ext_id}] Inserted {len(job.records)} records into {job.table}"
                 )
             finally:
-                self.queue.task_done()
+                self.job_done(job)
 
 
 class StreamingInsertThreadWorker(StreamingInsertWorker, _Thread):

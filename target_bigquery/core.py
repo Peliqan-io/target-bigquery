@@ -34,6 +34,7 @@ from io import BytesIO
 from multiprocessing import Process, Queue
 from multiprocessing.connection import Connection
 from pathlib import Path
+from queue import Empty
 from subprocess import PIPE, Popen
 from tempfile import TemporaryFile
 from textwrap import dedent, indent
@@ -261,6 +262,12 @@ class BigQueryCredentials:
 class BaseWorker(ABC):
     """Base class for workers."""
 
+    # A failed job is retried by the worker that ran it, not put back on the
+    # shared queue: at a barrier that queue already holds the shutdown sentinel,
+    # so a re-enqueued job sat behind it, was never retried, and the target
+    # wrote STATE past rows that were never loaded.
+    retry_job: Any = None
+
     def __init__(
         self,
         ext_id: str,
@@ -284,6 +291,22 @@ class BaseWorker(ABC):
     def run(self) -> None:
         """Run the worker."""
         raise NotImplementedError
+
+    def next_job(self, timeout: float = 30.0) -> Any:
+        """The job to retry, else the next one from the queue; None on the
+        shutdown sentinel or after `timeout` idle seconds."""
+        job, self.retry_job = self.retry_job, None
+        if job is not None:
+            return job
+        try:
+            return self.queue.get(timeout=timeout)
+        except Empty:
+            return None
+
+    def job_done(self, job: Any) -> None:
+        """task_done() once per job taken from the queue, after its last attempt."""
+        if job is not self.retry_job:
+            self.queue.task_done()
 
     def serialize_exception(self, exc: Exception) -> str:
         """Serialize an exception to a string."""
