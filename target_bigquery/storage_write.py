@@ -19,7 +19,6 @@ from time import sleep
 from multiprocessing import Process
 from multiprocessing.connection import Connection
 from multiprocessing.dummy import Process as _Thread
-from queue import Empty
 from typing import (
     TYPE_CHECKING,
     Any,
@@ -215,6 +214,12 @@ class BoundedOpenAppendRowsStream(writer.AppendRowsStream):
             )
         super()._on_response(response)
 
+# 5 tries, 2 s apart, then re-raise. Must be built as retry(**settings)(fn):
+# retry(fn, **settings) is tenacity's bare @retry -- it drops the settings and
+# retries forever with no wait (a rejected stream open then never failed).
+bounded_send = retry(wait=wait_fixed(2), stop=stop_after_attempt(5), reraise=True)
+
+
 def default(obj):
     if isinstance(obj, decimal.Decimal):
         return float(obj)
@@ -229,9 +234,7 @@ def get_application_stream(client: BigQueryWriteClient, job: "Job") -> StreamCom
     append_rows_stream = BoundedOpenAppendRowsStream(client, job.template)
     rv = (write_stream.name, append_rows_stream)
     job.stream_notifier.send(rv)
-    return *rv, retry(wait=wait_fixed(2), stop=stop_after_attempt(5), reraise=True)(
-        append_rows_stream.send
-    ), client  # keep client so its channel can be closed on recycle (PQ-3820)
+    return *rv, bounded_send(append_rows_stream.send), client  # keep client so its channel can be closed on recycle (PQ-3820)
 
 
 def get_default_stream(client: BigQueryWriteClient, job: "Job") -> StreamComponents:
@@ -242,9 +245,7 @@ def get_default_stream(client: BigQueryWriteClient, job: "Job") -> StreamCompone
     append_rows_stream = BoundedOpenAppendRowsStream(client, job.template)
     rv = (job.template.write_stream, append_rows_stream)
     job.stream_notifier.send(rv)
-    return *rv, retry(wait=wait_fixed(2), stop=stop_after_attempt(5), reraise=True)(
-        append_rows_stream.send
-    ), client  # keep client so its channel can be closed on recycle (PQ-3820)
+    return *rv, bounded_send(append_rows_stream.send), client  # keep client so its channel can be closed on recycle (PQ-3820)
 
 
 def generate_request(
@@ -328,8 +329,6 @@ class Job():
     # futures may still succeed — re-sending them duplicates rows (default
     # stream) or appends at new offsets (application streams).
     dispatched: int = 0
-    # (exception, formatted traceback) of the attempt that re-enqueued the job
-    error: Optional[Tuple[Exception, str]] = None
 
     def __init__(self,
         parent,
@@ -363,29 +362,8 @@ class StorageWriteBatchWorker(BaseWorker):
             bidi_logger = logging.getLogger("google.api_core.bidi")
             bidi_logger.setLevel(logging.DEBUG)
         while True:
-            try:
-                job: Optional[Job] = self.queue.get(timeout=30.0)
-            except Empty:
-                break
+            job: Optional[Job] = self.next_job(30.0)
             if job is None:
-                # A job that failed after the shutdown sentinel was queued was
-                # re-enqueued behind it and would never be retried. Report it so
-                # the target fails before writing STATE past its rows.
-                left = []
-                while True:
-                    try:
-                        left.append(self.queue.get_nowait())
-                    except Empty:
-                        break
-                for item in left:
-                    if item is None:
-                        self.queue.put(None)  # another worker's sentinel
-                failed = next((item for item in left if item is not None), None)
-                if failed is not None:
-                    self.error_notifier.send(failed.error or (
-                        RuntimeError("A job was left behind the shutdown sentinel and not retried."),
-                        f"Job for {failed.parent} was left behind the shutdown sentinel.",
-                    ))
                 break
             try:
                 # Chunk BEFORE any stream work: an empty job (its rows all took
@@ -484,8 +462,7 @@ class StorageWriteBatchWorker(BaseWorker):
                         f"[{self.ext_id}] permanent-looking error on {job.parent} "
                         f"(attempt {job.attempts}/{PERMANENT_ERROR_TOLERANCE}): {exc!r}"
                     )
-                    job.error = (exc, self.serialize_exception(exc))
-                    self.queue.put(job)
+                    self.retry_job = job
                 else:
                     self.logger.error(
                         f"[{self.ext_id}] permanent target error on {job.parent}, "
@@ -507,19 +484,21 @@ class StorageWriteBatchWorker(BaseWorker):
                     # TODO: add a metric for this + a DLQ & wrap exception type
                     self.error_notifier.send((exc, self.serialize_exception(exc)))
                 else:
-                    job.error = (exc, self.serialize_exception(exc))
-                    self.queue.put(job)
+                    self.retry_job = job
                 # Track errors and recycle the stream if we hit a threshold
                 # 1 bad payload 👆 is not indicative of a bad bidi stream as it _could_
                 # be a transient error or luck of the draw with the first payload.
                 # 5 worker-specific errors is a good threshold to recycle the stream
                 # and start fresh. This is an arbitrary number and can be adjusted.
+                # Recycled in place: raising would kill the worker and lose the
+                # retry it holds; the next attempt opens a fresh client/stream.
                 if self.max_errors_before_recycle == 0:
                     self.wait(drain=True)
                     self.close_cached_streams()
-                    raise
+                    self.cache.clear()
+                    self.max_errors_before_recycle = 5
             finally:
-                self.queue.task_done()
+                self.job_done(job)
         # Wait for all in-flight requests to complete after poison pill
         self.logger.info(f"[{self.ext_id}] : {self.offsets}")
         self.wait(drain=True)

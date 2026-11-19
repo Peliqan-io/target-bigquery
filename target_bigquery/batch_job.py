@@ -16,7 +16,6 @@ import os
 from io import BytesIO
 from multiprocessing import Process
 from multiprocessing.dummy import Process as _Thread
-from queue import Empty
 from typing import Any, Dict, NamedTuple, Optional, Type, Union
 
 import orjson, decimal
@@ -51,10 +50,7 @@ class BatchJobWorker(BaseWorker):
         """Run the worker."""
         client: bigquery.Client = bigquery_client_factory(self.credentials)
         while True:
-            try:
-                job: Optional[Job] = self.queue.get(timeout=30.0)
-            except Empty:
-                break
+            job: Optional[Job] = self.next_job(30.0)
             if job is None:
                 break
             try:
@@ -65,20 +61,20 @@ class BatchJobWorker(BaseWorker):
                     job_config=bigquery.LoadJobConfig(**job.config),
                 ).result()
             except Exception as exc:
-                job.attempt += 1
+                job = job._replace(attempt=job.attempt + 1)  # Job is a NamedTuple
                 if job.attempt > 3:
                     # TODO: add a metric for this + a DLQ & wrap exception type
                     self.error_notifier.send((exc, self.serialize_exception(exc)))
                     raise
                 else:
-                    self.queue.put(job)
+                    self.retry_job = job
             else:
                 self.job_notifier.send(True)
                 self.log_notifier.send(
                     f"[{self.ext_id}] Loaded {len(job.data)} bytes into {job.table}."
                 )
             finally:
-                self.queue.task_done()
+                self.job_done(job)
 
 
 class BatchJobThreadWorker(BatchJobWorker, _Thread):
