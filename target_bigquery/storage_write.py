@@ -43,6 +43,7 @@ from google.api_core.exceptions import (
     NotFound,
     PermissionDenied,
     Forbidden,
+    Unknown,
 )
 from google.protobuf import json_format
 from proto import Message
@@ -186,8 +187,16 @@ def _close_client(client: BigQueryWriteClient) -> None:
 class BoundedOpenAppendRowsStream(writer.AppendRowsStream):
     """AppendRowsStream whose open wait is bounded by STREAM_OPEN_TIMEOUT."""
 
+    rpc_error: Optional[BaseException] = None
+
     def _open(self, initial_request, timeout: float = STREAM_OPEN_TIMEOUT):
         return super()._open(initial_request, timeout=timeout)
+
+    def _on_rpc_done(self, reason: Optional[BaseException] = None) -> None:
+        # send() raises a generic "There was a problem opening the stream"; the
+        # server's reason (e.g. a proto vs table type mismatch) only arrives here.
+        self.rpc_error = reason
+        super()._on_rpc_done(reason)
 
     def _on_response(self, response):
         # On a failed append the library keeps only the status message ("Please
@@ -319,7 +328,9 @@ class Job():
     # futures may still succeed — re-sending them duplicates rows (default
     # stream) or appends at new offsets (application streams).
     dispatched: int = 0
-    
+    # (exception, formatted traceback) of the attempt that re-enqueued the job
+    error: Optional[Tuple[Exception, str]] = None
+
     def __init__(self,
         parent,
         template,
@@ -357,6 +368,24 @@ class StorageWriteBatchWorker(BaseWorker):
             except Empty:
                 break
             if job is None:
+                # A job that failed after the shutdown sentinel was queued was
+                # re-enqueued behind it and would never be retried. Report it so
+                # the target fails before writing STATE past its rows.
+                left = []
+                while True:
+                    try:
+                        left.append(self.queue.get_nowait())
+                    except Empty:
+                        break
+                for item in left:
+                    if item is None:
+                        self.queue.put(None)  # another worker's sentinel
+                failed = next((item for item in left if item is not None), None)
+                if failed is not None:
+                    self.error_notifier.send(failed.error or (
+                        RuntimeError("A job was left behind the shutdown sentinel and not retried."),
+                        f"Job for {failed.parent} was left behind the shutdown sentinel.",
+                    ))
                 break
             try:
                 # Chunk BEFORE any stream work: an empty job (its rows all took
@@ -455,6 +484,7 @@ class StorageWriteBatchWorker(BaseWorker):
                         f"[{self.ext_id}] permanent-looking error on {job.parent} "
                         f"(attempt {job.attempts}/{PERMANENT_ERROR_TOLERANCE}): {exc!r}"
                     )
+                    job.error = (exc, self.serialize_exception(exc))
                     self.queue.put(job)
                 else:
                     self.logger.error(
@@ -466,6 +496,10 @@ class StorageWriteBatchWorker(BaseWorker):
                     self.close_cached_streams()
                     raise
             except Exception as exc:
+                entry = self.cache.get(job.parent)
+                rpc_error = getattr(entry[1], "rpc_error", None) if entry else None
+                if isinstance(exc, Unknown) and rpc_error is not None:
+                    exc = rpc_error  # report the server's reason, not the client's generic one
                 job.attempts += 1
                 self.logger.info(f"job.attempts : {job.attempts}")
                 self.max_errors_before_recycle -= 1
@@ -473,6 +507,7 @@ class StorageWriteBatchWorker(BaseWorker):
                     # TODO: add a metric for this + a DLQ & wrap exception type
                     self.error_notifier.send((exc, self.serialize_exception(exc)))
                 else:
+                    job.error = (exc, self.serialize_exception(exc))
                     self.queue.put(job)
                 # Track errors and recycle the stream if we hit a threshold
                 # 1 bad payload 👆 is not indicative of a bad bidi stream as it _could_
