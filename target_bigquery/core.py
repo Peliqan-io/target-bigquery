@@ -533,11 +533,19 @@ class BaseBigQuerySink(BatchSink):
         # discovery and lets the backend clean up any orphaned staging table.
         name = f"{TEMP_TABLE_MARKER}{self.table_name}__{int(time.time())}_{self._staging_seq}"
         self.table = BigQueryTable(name=name, **self._staging_opts)
+        table_opts = {"expires": datetime.datetime.now() + datetime.timedelta(days=7)}
+        live_schema = getattr(self, "_live_target_schema", None)
+        if live_schema and self.merge_target is not None:
+            # Clone the live layout, RECORD subfield order included: BigQuery
+            # assigns STRUCTs by position, not name, so a staging table built
+            # from the tap's field order can make the MERGE fail or put values
+            # in the wrong subfields. Writers still load into it by name.
+            table_opts["schema"] = tuple(live_schema)  # tuple: as_table() is @cache'd
         self.table.create_table(
             self.client,
             self.apply_transforms,
             **{
-                "table": {"expires": datetime.datetime.now() + datetime.timedelta(days=7)},
+                "table": table_opts,
                 "dataset": {
                     "location": self.config.get(
                         "location", BigQueryTable.default_dataset_options()["location"]
@@ -720,6 +728,38 @@ class BaseBigQuerySink(BatchSink):
             )
 
 
+def _is_record(f: SchemaField) -> bool:
+    return f.field_type.upper() in ("RECORD", "STRUCT")
+
+
+def _merge_schema_fields(
+    live: List[SchemaField], expected: List[SchemaField]
+) -> Tuple[List[SchemaField], bool]:
+    """Append the `expected` fields `live` lacks, recursing into RECORDs.
+
+    Live order is kept and new fields go last at every level, so existing data
+    never shifts position. Names match case-insensitively, like BigQuery's own
+    uniqueness check. Returns the merged fields and whether anything was added."""
+    expected_by_name = {f.name.lower(): f for f in expected}
+    live_names = {f.name.lower() for f in live}
+    merged, changed = [], False
+    for f in live:
+        exp = expected_by_name.get(f.name.lower())
+        if exp is not None and _is_record(f) and _is_record(exp):
+            fields, sub_changed = _merge_schema_fields(list(f.fields), list(exp.fields))
+            if sub_changed:
+                api = f.to_api_repr()
+                api["fields"] = [s.to_api_repr() for s in fields]
+                f = SchemaField.from_api_repr(api)
+                changed = True
+        merged.append(f)
+    for exp in expected:
+        if exp.name.lower() not in live_names:
+            merged.append(exp)
+            changed = True
+    return merged, changed
+
+
 class Denormalized:
     """This class provides common overrides for denormalized sinks and should be subclassed
     with an existing sink with higher MRO: DenormalizedSink(Denormalized, ExistingSink)."""
@@ -743,20 +783,25 @@ class Denormalized:
 
         Fetching the live table also makes the update safe in the other direction:
         the field mask replaces the schema wholesale, so a client-side base would
-        drop any column BigQuery has but the tap no longer sends."""
+        drop any column BigQuery has but the tap no longer sends.
+
+        RECORD columns are diffed recursively: a subfield new to the tap (e.g. a
+        field Exact Online added to a nested lines record) must be added too, or
+        the MERGE assigns a wider staging STRUCT to the narrower live one and
+        fails with 400. The resulting live schema is kept so merge staging
+        tables can be created with exactly this layout (see _new_staging_table)."""
         table = self.client.get_table(self.table.as_ref())
-        current_schema = table.schema[:]
-        mut_schema = table.schema[:]
-        for expected_field in self.table.get_resolved_schema(self.apply_transforms):
-            if not any(field.name.lower() == expected_field.name.lower() for field in current_schema):
-                mut_schema.append(expected_field)
-        if len(mut_schema) > len(current_schema):
-            table.schema = mut_schema
+        merged, changed = _merge_schema_fields(
+            list(table.schema), self.table.get_resolved_schema(self.apply_transforms)
+        )
+        if changed:
+            table.schema = merged
             self.client.update_table(
                 table,
                 ["schema"],
                 retry=bigquery.DEFAULT_RETRY.with_timeout(15),
             )
+        self._live_target_schema = merged
 
     def preprocess_record(
         self: BaseBigQuerySink, record: Dict[str, Any], context: Dict[str, Any]
